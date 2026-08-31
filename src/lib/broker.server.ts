@@ -476,37 +476,59 @@ export async function verifySignal(
 ): Promise<VerifyResult> {
   let candles: Candle[];
   try {
-    candles = await getCandles(activeId, 30);
+    candles = await getCandles(activeId, 120);
   } catch {
     return { ok: false, reason: "Não foi possível obter velas ao vivo", liveDir: null };
   }
 
-  if (candles.length < 5) {
+  if (candles.length < 35) {
     return { ok: false, reason: "Dados insuficientes para verificação", liveDir: null };
   }
 
-  const last5 = candles.slice(-5);
-  const closes = last5.map((c) => c.close);
-  const up = closes.filter((c, i) => i > 0 && c > closes[i - 1]).length;
-  const liveDir: "call" | "put" = up >= 3 ? "call" : "put";
+  const { evaluateTaxaDividida } = await import("#/lib/taxa-dividida.ts");
+  // Evaluate the closed candles (before forming candle)
+  const closed = candles.slice(0, -1);
+  const evalResult = evaluateTaxaDividida(closed);
 
-  if (liveDir !== expectedDir) {
+  if (!evalResult) {
+    return { ok: false, reason: "Falha na análise Taxa Dividida", liveDir: null };
+  }
+
+  if (evalResult.buyOK && expectedDir === "call") {
     return {
-      ok: false,
-      reason: `Sinal virou ao vivo: mercado indica ${liveDir.toUpperCase()}`,
-      liveDir,
+      ok: true,
+      reason: "Taxa Dividida v3: Sinal de COMPRA confirmado!",
+      liveDir: "call",
     };
   }
 
-  const lastClosed = candles[candles.length - 2] ?? candles[candles.length - 1];
-  const candleColor = lastClosed.close >= lastClosed.open ? "call" : "put";
-  if (candleColor !== expectedDir) {
+  if (evalResult.sellOK && expectedDir === "put") {
     return {
-      ok: false,
-      reason: `Vela atual na cor contrária (${candleColor === "call" ? "verde" : "vermelha"})`,
-      liveDir,
+      ok: true,
+      reason: "Taxa Dividida v3: Sinal de VENDA confirmado!",
+      liveDir: "put",
     };
   }
 
-  return { ok: true, reason: "Verificação ok — sinal confirmado ao vivo", liveDir };
+  if (evalResult.armedBuy && expectedDir === "call") {
+    return {
+      ok: true,
+      reason: "Taxa Dividida v3: Setup Compra armado e aceito",
+      liveDir: "call",
+    };
+  }
+
+  if (evalResult.armedSell && expectedDir === "put") {
+    return {
+      ok: true,
+      reason: "Taxa Dividida v3: Setup Venda armado e aceito",
+      liveDir: "put",
+    };
+  }
+
+  return {
+    ok: false,
+    reason: `Setup não confirmado no momento (${evalResult.statusText})`,
+    liveDir: evalResult.direction,
+  };
 }

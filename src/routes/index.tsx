@@ -268,7 +268,7 @@ function AssetRow({ asset }: { asset: OtcAsset & { payout: number } }) {
 
 // ─── Main OTC Panel ─────────────────────────────────────────────────────────
 
-function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[]; live?: boolean }) {
+function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?: boolean }) {
   const search = Route.useSearch();
   const assetId =
     search && "asset" in (search as Record<string, unknown>)
@@ -391,7 +391,9 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
     };
   }, [assetId]);
 
-  // Countdown to next candle (Brasília time, UTC-3)
+  // Countdown to next candle (Brasília time, UTC-3 synchronized with broker clock)
+  const brokerOffsetRef = useRef<number>(0);
+
   useEffect(() => {
     const fmt = new Intl.DateTimeFormat("pt-BR", {
       hour: "2-digit",
@@ -400,7 +402,7 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
       timeZone: "America/Sao_Paulo",
     });
     countRef.current = setInterval(() => {
-      const now = Math.floor(Date.now() / 1000);
+      const now = Math.floor((Date.now() + brokerOffsetRef.current) / 1000);
       setCountdown(60 - (now % 60));
       const next = now + (60 - (now % 60));
       setNextTime(fmt.format(new Date(next * 1000)));
@@ -410,43 +412,90 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
     };
   }, []);
 
-  // Live tick: poll the current price every 2s and move the forming candle.
-  // Also accumulates the 1s candles into a rolling bull/bear force gauge.
+  // Live Realtime Stream (SSE): Receives broker candle ticks every 500ms with zero delay
+  // and syncs exact server timestamp directly with the broker.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (!live || !asset) return;
+    if (!asset) return;
     let disposed = false;
-    const poll = async () => {
-      try {
-        const { fetchTick } = await import("#/lib/otc.functions.ts");
-        const tick = await fetchTick({ data: { activeId: asset.id } });
-        if (disposed || !tick) return;
-        setLivePrice(tick.price);
-        setCandles((prev) => applyTick(prev, tick));
+    let eventSource: EventSource | null = null;
 
-        if (tick.candles && tick.candles.length) {
-          const map = new Map(tickSeriesRef.current.map((c) => [c.time, c]));
-          for (const c of tick.candles) map.set(c.time, c);
-          const arr = [...map.values()].sort((a, b) => a.time - b.time).slice(-60);
-          tickSeriesRef.current = arr;
-          setForce(computeForce(arr));
+    try {
+      eventSource = new EventSource(`/api/stream?activeId=${asset.id}`);
+
+      eventSource.addEventListener("timeSync", (ev) => {
+        if (disposed) return;
+        try {
+          const data = JSON.parse(ev.data) as { serverTime: number; clientTimestamp: number };
+          if (data && data.serverTime) {
+            brokerOffsetRef.current = data.serverTime - Date.now();
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore transient tick failures
-      }
-    };
-    void poll();
-    const iv = setInterval(() => void poll(), 2000);
+      });
+
+      eventSource.addEventListener("candle", (ev) => {
+        if (disposed) return;
+        try {
+          const c = JSON.parse(ev.data) as {
+            time: number;
+            open: number;
+            high: number;
+            low: number;
+            close: number;
+            activeId: number;
+          };
+          if (!c || c.activeId !== asset.id) return;
+
+          setLivePrice(c.close);
+          setCandles((prev) => {
+            if (!prev.length) {
+              return [c];
+            }
+            const copy = prev.slice();
+            const last = copy[copy.length - 1];
+            if (c.time === last.time) {
+              copy[copy.length - 1] = {
+                time: c.time,
+                open: c.open,
+                high: Math.max(last.high, c.high),
+                low: Math.min(last.low, c.low),
+                close: c.close,
+              };
+              tickSeriesRef.current = copy.slice(-60);
+              setForce(computeForce(copy.slice(-30)));
+              return copy;
+            } else if (c.time > last.time) {
+              copy.push(c);
+              if (copy.length > 160) copy.shift();
+              tickSeriesRef.current = copy.slice(-60);
+              setForce(computeForce(copy.slice(-30)));
+              return copy;
+            }
+            return prev;
+          });
+        } catch {
+          // ignore parse error
+        }
+      });
+
+      eventSource.onerror = () => {
+        // SSE error handled automatically by browser reconnect
+      };
+    } catch {
+      // Fallback handled by intervals
+    }
+
     return () => {
       disposed = true;
-      clearInterval(iv);
-      tickSeriesRef.current = [];
+      if (eventSource) {
+        eventSource.close();
+      }
     };
-  }, [live, asset?.id]);
+  }, [asset?.id]);
 
-  // Periodic refresh of the REAL broker candles for the selected asset, so the
-  // chart always matches the actual market (works for every asset, even when
-  // the 1-second tick feed is unavailable for that pair).
+  // Periodic refresh of the complete 150 REAL broker candles for accuracy
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!asset) return;
@@ -462,7 +511,7 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
       }
     };
     void refresh();
-    const iv = setInterval(() => void refresh(), 15000);
+    const iv = setInterval(() => void refresh(), 10000);
     return () => {
       disposed = true;
       clearInterval(iv);
@@ -649,14 +698,16 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
                 {candles.length > 0 ? (
                   <CandlestickChart
                     candles={candles.slice(-60)}
+                    emaMacro={analysis?.emaMacro}
+                    emaInter={analysis?.emaInter}
                     ema9={analysis?.ema9}
                     ema21={analysis?.ema21}
+                    gatilhoTaxa50={analysis?.gatilhoTaxa50 ?? undefined}
                     bbUpper={analysis?.bbUpper}
                     bbMid={analysis?.bbMid}
                     bbLower={analysis?.bbLower}
                     nextOpen={livePrice ?? analysis?.lastPrice}
-                    // Probability-based projection from all broker data
-                    // (180 candles + patterns + ticks), not just the current color.
+                    markers={analysis?.markers}
                     nextDir={previewDir}
                     nextProb={previewProb}
                   />
@@ -737,28 +788,37 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
             {/* Indicators */}
             {analysis && (
               <div className="bg-gray-900 rounded-xl border border-gray-800 p-3">
-                <p className="text-xs text-gray-500 font-semibold uppercase mb-2">Indicadores</p>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs text-gray-400 font-bold uppercase">JOSE TRADER · TAXA DIVIDIDA v3</p>
+                  <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded font-mono font-bold">
+                    TAXA3
+                  </span>
+                </div>
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <IndicatorBadge
-                    label="EMA9"
-                    value={analysis.ema9.toFixed(4)}
-                    color="text-cyan-400"
+                    label="Macro EMA 100"
+                    value={analysis.emaMacro ? analysis.emaMacro.toFixed(4) : "—"}
+                    color={analysis.lastPrice >= analysis.emaMacro ? "text-emerald-400" : "text-red-400"}
                   />
                   <IndicatorBadge
-                    label="EMA21"
-                    value={analysis.ema21.toFixed(4)}
+                    label="Inter EMA 50"
+                    value={analysis.emaInter ? analysis.emaInter.toFixed(4) : "—"}
+                    color={analysis.lastPrice >= analysis.emaInter ? "text-emerald-400" : "text-red-400"}
+                  />
+                  <IndicatorBadge
+                    label="Buffer 1 (SMA1-34)"
+                    value={analysis.buffer1 !== undefined ? analysis.buffer1.toFixed(5) : "—"}
+                    color={analysis.buffer1 >= analysis.buffer2 ? "text-emerald-400" : "text-red-400"}
+                  />
+                  <IndicatorBadge
+                    label="Buffer 2 (WMA 5)"
+                    value={analysis.buffer2 !== undefined ? analysis.buffer2.toFixed(5) : "—"}
                     color="text-yellow-400"
                   />
                   <IndicatorBadge
-                    label="RSI"
-                    value={analysis.rsi.toFixed(1)}
-                    color={
-                      analysis.rsi > 70
-                        ? "text-red-400"
-                        : analysis.rsi < 30
-                          ? "text-emerald-400"
-                          : "text-gray-300"
-                    }
+                    label="Taxa 50% Gatilho"
+                    value={analysis.gatilhoTaxa50 ? analysis.gatilhoTaxa50.toFixed(4) : "Aguardando"}
+                    color="text-purple-400"
                   />
                   <IndicatorBadge
                     label="Tendência"
@@ -777,20 +837,10 @@ function OtcPanel({ assets, live }: { assets: (OtcAsset & { payout: number })[];
                           : "text-gray-400"
                     }
                   />
-                  <IndicatorBadge
-                    label="BB Sup"
-                    value={analysis.bbUpper.toFixed(4)}
-                    color="text-orange-400"
-                  />
-                  <IndicatorBadge
-                    label="BB Inf"
-                    value={analysis.bbLower.toFixed(4)}
-                    color="text-blue-400"
-                  />
                 </div>
                 <div className="mt-2 pt-2 border-t border-gray-800">
-                  <p className="text-xs text-gray-500">Contexto das velas:</p>
-                  <p className="text-xs text-gray-300 mt-0.5">{analysis.candleContext}</p>
+                  <p className="text-xs text-gray-500">Status do Setup:</p>
+                  <p className="text-xs text-emerald-300 font-medium mt-0.5">{analysis.statusText ?? analysis.candleContext}</p>
                 </div>
               </div>
             )}
@@ -820,6 +870,11 @@ function SignalBox({
     reasons: string[];
     blocks: string[];
     candleContext: string;
+    statusText?: string;
+    buyOK?: boolean;
+    sellOK?: boolean;
+    armedBuy?: boolean;
+    armedSell?: boolean;
     analysts: {
       name: string;
       icon: string;
@@ -839,47 +894,70 @@ function SignalBox({
 }) {
   const isCall = analysis.direction === "call";
   const ready = analysis.signalReady === true;
+  const armed = analysis.armedBuy || analysis.armedSell;
   const analysts = analysis.analysts ?? [];
-  const agree = analysts.filter((a) => a.direction === analysis.direction).length;
 
   return (
     <div
       className={`rounded-xl border overflow-hidden ${
         ready
           ? isCall
-            ? "bg-emerald-900/30 border-emerald-500/50 shadow-lg shadow-emerald-500/10"
-            : "bg-red-900/30 border-red-500/50 shadow-lg shadow-red-500/10"
-          : "bg-gray-900 border-gray-700"
+            ? "bg-emerald-950/40 border-emerald-500/60 shadow-xl shadow-emerald-500/20"
+            : "bg-red-950/40 border-red-500/60 shadow-xl shadow-red-500/20"
+          : armed
+            ? "bg-yellow-950/30 border-yellow-500/40 shadow-lg shadow-yellow-500/10"
+            : "bg-gray-900 border-gray-700"
       }`}
     >
-      {/* Direction */}
-      <div className="p-4 text-center">
-        <span className="text-xs text-gray-500 font-medium uppercase tracking-wider">
-          Sinal OTC
+      {/* Strategy Header */}
+      <div className="bg-gray-900/90 border-b border-gray-800 px-4 py-2 flex items-center justify-between">
+        <span className="text-xs font-bold text-gray-300 flex items-center gap-1.5">
+          <span>🎯</span> JOSE TRADER · TAXA DIVIDIDA v3
         </span>
+        <span className="text-[10px] bg-emerald-500/20 text-emerald-400 font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 font-bold">
+          {ready ? "ENTRADA CONFIRMADA" : armed ? "SETUP ARMADO" : "MONITORANDO"}
+        </span>
+      </div>
+
+      {/* Direction & Main Trigger */}
+      <div className="p-4 text-center">
         {ready ? (
           <>
+            <div className="text-xs uppercase font-bold tracking-widest text-emerald-400">
+              ⚡ SINAL DE ENTRADA NA MESMA VELA
+            </div>
             <div
-              className={`mt-2 text-4xl font-black tracking-tight ${
+              className={`mt-1 text-3xl sm:text-4xl font-black tracking-tight ${
                 isCall ? "text-emerald-400" : "text-red-400"
               }`}
             >
-              {isCall ? "▲ CALL" : "▼ PUT"}
+              {isCall ? "▲ JOSE COMPRAR" : "▼ JOSE VENDER"}
             </div>
             <div
-              className={`mt-1 text-xs font-bold text-white px-3 py-1 rounded-full inline-block bg-gradient-to-r ${
-                isCall ? "from-emerald-500 to-cyan-500" : "from-red-500 to-orange-500"
+              className={`mt-2 text-xs font-bold text-white px-3 py-1 rounded-full inline-block bg-gradient-to-r ${
+                isCall ? "from-emerald-600 to-teal-500" : "from-red-600 to-orange-500"
               }`}
             >
-              ✅ CONSENSO {agree} de {analysts.length} análises
+              🎯 TAXA DIVIDIDA 50% + MICRO MOTOR OK
             </div>
           </>
+        ) : armed ? (
+          <div className="py-2">
+            <div className="text-xs uppercase font-bold text-yellow-400">
+              🟡 SETUP ARMADO (PADRÃO 5 VELAS DETECTADO)
+            </div>
+            <div className="mt-1 text-2xl font-black text-yellow-300">
+              {analysis.armedBuy ? "▲ AGUARDANDO DISPARO COMPRA" : "▼ AGUARDANDO DISPARO VENDA"}
+            </div>
+            <div className="mt-1 text-xs text-gray-400">
+              Aguardando confirmação do micro motor (SMA1 cruzando WMA5)
+            </div>
+          </div>
         ) : (
-          <div className="mt-2">
-            <div className="text-2xl font-bold text-gray-500">⏳ AGUARDANDO CONSENSO</div>
+          <div className="py-2">
+            <div className="text-xl font-bold text-gray-400">⏳ MONITORANDO PADRÃO</div>
             <div className="mt-1 text-xs text-gray-500">
-              Ainda sem maioria: {agree} de {analysts.length} análises apontam{" "}
-              {isCall ? "▲ CALL" : "▼ PUT"}
+              Aguardando rompimento &gt;50% e devolução na taxa de retração
             </div>
           </div>
         )}
@@ -888,11 +966,11 @@ function SignalBox({
       {/* Strength bar */}
       <div className="px-4 pb-3">
         <div className="flex items-center justify-between text-xs text-gray-500 mb-1">
-          <span>Acordo entre análises</span>
+          <span>Força do Setup</span>
           <span
             className={
-              analysis.strength >= 75
-                ? "text-emerald-400"
+              analysis.strength >= 80
+                ? "text-emerald-400 font-bold"
                 : analysis.strength >= 60
                   ? "text-yellow-400"
                   : "text-gray-500"
@@ -904,7 +982,7 @@ function SignalBox({
         <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${
-              analysis.strength >= 75
+              analysis.strength >= 80
                 ? "bg-emerald-400"
                 : analysis.strength >= 60
                   ? "bg-yellow-400"
@@ -917,7 +995,7 @@ function SignalBox({
 
       {/* Independent analyses */}
       <div className="px-4 pb-3">
-        <p className="text-xs text-gray-500 mb-1.5">Análises independentes:</p>
+        <p className="text-xs text-gray-500 mb-1.5 font-semibold">Módulos da Estratégia:</p>
         <div className="space-y-1">
           {analysts.map((a, i) => (
             <div
@@ -927,14 +1005,14 @@ function SignalBox({
                   ? "bg-gray-800/50 text-gray-500"
                   : a.direction === analysis.direction
                     ? isCall
-                      ? "bg-emerald-900/40 text-emerald-300"
-                      : "bg-red-900/40 text-red-300"
+                      ? "bg-emerald-900/40 text-emerald-300 border border-emerald-800/40"
+                      : "bg-red-900/40 text-red-300 border border-red-800/40"
                     : "bg-gray-800/50 text-gray-400"
               }`}
             >
               <span className="text-base leading-none">{a.icon}</span>
               <span className="font-semibold whitespace-nowrap">{a.name}</span>
-              <span className="flex-1 truncate">{a.opinion}</span>
+              <span className="flex-1 truncate text-gray-300">{a.opinion}</span>
               <span
                 className={`font-bold ${
                   a.direction === "hold"
@@ -955,11 +1033,11 @@ function SignalBox({
       {/* Reasons */}
       {analysis.reasons.length > 0 && (
         <div className="px-4 pb-3">
-          <p className="text-xs text-gray-500 mb-1.5">Resumo:</p>
+          <p className="text-xs text-gray-500 mb-1.5">Regras do Setup:</p>
           <div className="space-y-1">
-            {analysis.reasons.slice(0, 3).map((r, i) => (
+            {analysis.reasons.slice(0, 4).map((r, i) => (
               <p key={i} className="text-xs text-gray-400 flex items-start gap-1">
-                <span className="text-emerald-500 mt-0.5">•</span>
+                <span className="text-emerald-500 mt-0.5 font-bold">•</span>
                 {r}
               </p>
             ))}
@@ -983,7 +1061,7 @@ function SignalBox({
           </div>
           <div className="flex-1">
             <label className="text-xs text-gray-500 block mb-1">Lucro estimado</label>
-            <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-emerald-400">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-emerald-400 font-bold">
               +${((parseFloat(entryAmount) || 0) * (assetPayout / 100)).toFixed(2)}
             </div>
           </div>
@@ -1003,7 +1081,7 @@ function SignalBox({
 
         {/* Demo/Real toggle */}
         <div className="flex items-center justify-between mb-3">
-          <span className="text-xs text-gray-500">Conta</span>
+          <span className="text-xs text-gray-500">Conta de Operação</span>
           <div className="flex gap-1 bg-gray-800 rounded-lg p-0.5">
             <button
               onClick={() => setIsDemo(true)}
@@ -1024,7 +1102,7 @@ function SignalBox({
           </div>
         </div>
 
-        {/* Execute button — only shows on majority consensus */}
+        {/* Execute button */}
         {ready ? (
           <button
             onClick={onExecute}
@@ -1040,51 +1118,22 @@ function SignalBox({
             {executing ? (
               <span className="flex items-center justify-center gap-2">
                 <div className="w-4 h-4 border-2 border-gray-500 border-t-white rounded-full animate-spin" />
-                Verificando...
+                Executando na Broker...
               </span>
             ) : (
-              `${isCall ? "▲" : "▼"} ENTRAR ${isDemo ? "DEMO" : "REAL"}`
+              `${isCall ? "▲ ENTRAR COMPRA" : "▼ ENTRAR VENDA"} (${isDemo ? "DEMO" : "REAL"})`
             )}
           </button>
         ) : (
-          <div className="w-full py-3 rounded-xl text-center text-sm text-gray-600 bg-gray-800/50 border border-gray-800">
-            {`Aguardando consenso (acordo ${analysis.strength}%)`}
+          <div className="w-full py-3 rounded-xl text-center text-sm text-gray-500 bg-gray-800/50 border border-gray-800">
+            {armed
+              ? "⚡ Setup armado! Aguardando gatilho no nascimento da vela"
+              : "⏳ Aguardando confirmação do setup Taxa Dividida..."}
           </div>
         )}
       </div>
     </div>
   );
-}
-
-// ─── Live tick helpers ───────────────────────────────────────────────────────
-
-function applyTick(
-  prev: { time: number; open: number; high: number; low: number; close: number }[],
-  tick: { time: number; price: number },
-) {
-  if (!prev.length || !tick) return prev;
-  const next = prev.slice();
-  const last = next[next.length - 1];
-  const tickMin = Math.floor(tick.time / 60) * 60;
-  if (tickMin === last.time) {
-    next[next.length - 1] = {
-      ...last,
-      close: tick.price,
-      high: Math.max(last.high, tick.price),
-      low: Math.min(last.low, tick.price),
-    };
-  } else if (tickMin > last.time) {
-    // A new minute just opened — start its forming candle
-    next.push({
-      time: tickMin,
-      open: tick.price,
-      high: tick.price,
-      low: tick.price,
-      close: tick.price,
-    });
-    if (next.length > 160) next.shift();
-  }
-  return next;
 }
 
 // ─── Bulls vs Bears force gauge ──────────────────────────────────────────────
@@ -1144,22 +1193,20 @@ function tickMomentum(series: { open: number; close: number }[]): number {
 
 function CandlestickChart({
   candles,
-  ema9,
-  ema21,
-  bbUpper,
-  bbMid,
-  bbLower,
+  emaMacro,
+  emaInter,
+  gatilhoTaxa50,
   nextOpen,
+  markers,
   nextDir,
   nextProb,
 }: {
   candles: { time: number; open: number; high: number; low: number; close: number }[];
-  ema9?: number;
-  ema21?: number;
-  bbUpper?: number;
-  bbMid?: number;
-  bbLower?: number;
+  emaMacro?: number;
+  emaInter?: number;
+  gatilhoTaxa50?: number;
   nextOpen?: number;
+  markers?: { time: number; type: "buy" | "sell" | "armed_buy" | "armed_sell"; price: number; label: string }[];
   nextDir?: "call" | "put";
   nextProb?: number;
 }) {
@@ -1167,43 +1214,34 @@ function CandlestickChart({
 
   const W = 700;
   const H = 280;
-  const PAD = { top: 10, right: 10, bottom: 20, left: 8 };
+  const PAD = { top: 16, right: 12, bottom: 24, left: 8 };
   const chartW = W - PAD.left - PAD.right;
   const chartH = H - PAD.top - PAD.bottom;
 
   const highs = candles.map((c) => c.high);
   const lows = candles.map((c) => c.low);
-  const maxPrice = Math.max(...highs, bbUpper ?? -Infinity, nextOpen ?? -Infinity);
-  const minPrice = Math.min(...lows, bbLower ?? Infinity, nextOpen ?? Infinity);
+  const maxPrice = Math.max(
+    ...highs,
+    emaMacro ?? -Infinity,
+    emaInter ?? -Infinity,
+    gatilhoTaxa50 ?? -Infinity,
+    nextOpen ?? -Infinity,
+  );
+  const minPrice = Math.min(
+    ...lows,
+    emaMacro ?? Infinity,
+    emaInter ?? Infinity,
+    gatilhoTaxa50 ?? Infinity,
+    nextOpen ?? Infinity,
+  );
   const priceRange = maxPrice - minPrice || 1;
 
   const toY = (price: number) =>
     PAD.top + ((maxPrice - price) / priceRange) * chartH;
 
   const n = candles.length;
-  const candleW = Math.max(2, Math.floor(chartW / n) - 1);
+  const candleW = Math.max(3, Math.floor(chartW / n) - 1);
   const toX = (i: number) => PAD.left + (i / n) * chartW + candleW / 2;
-
-  const bbPoints = candles
-    .map((_, i) => {
-      if (!bbUpper) return "";
-      return `${toX(i).toFixed(1)},${toY(bbUpper).toFixed(1)}`;
-    })
-    .join(" ");
-
-  const bbMidPoints = candles
-    .map((_, i) => {
-      if (!bbMid) return "";
-      return `${toX(i).toFixed(1)},${toY(bbMid).toFixed(1)}`;
-    })
-    .join(" ");
-
-  const bbLowerPoints = candles
-    .map((_, i) => {
-      if (!bbLower) return "";
-      return `${toX(i).toFixed(1)},${toY(bbLower).toFixed(1)}`;
-    })
-    .join(" ");
 
   // Price labels
   const priceLabels = [maxPrice, (maxPrice + minPrice) / 2, minPrice];
@@ -1211,7 +1249,7 @@ function CandlestickChart({
   return (
     <svg
       viewBox={`0 0 ${W} ${H}`}
-      className="w-full h-64"
+      className="w-full h-64 select-none"
       preserveAspectRatio="xMidYMid meet"
     >
       {/* Grid lines */}
@@ -1228,58 +1266,44 @@ function CandlestickChart({
         />
       ))}
 
-      {/* Bollinger bands */}
-      {bbUpper && bbLower && (
-        <>
-          <polygon
-            points={`${bbPoints} ${bbLowerPoints.split(" ").reverse().join(" ")}`}
-            fill="rgba(99,102,241,0.05)"
-          />
-          <polyline
-            points={bbPoints}
-            fill="none"
-            stroke="rgba(251,146,60,0.5)"
-            strokeWidth="1"
-          />
-          <polyline
-            points={bbMidPoints}
-            fill="none"
-            stroke="rgba(148,163,184,0.4)"
-            strokeWidth="1"
-            strokeDasharray="3,3"
-          />
-          <polyline
-            points={bbLowerPoints}
-            fill="none"
-            stroke="rgba(96,165,250,0.5)"
-            strokeWidth="1"
-          />
-        </>
-      )}
-
-      {/* EMA lines */}
-      {ema9 && (
+      {/* EMA Macro 100 Line */}
+      {emaMacro && (
         <line
           x1={PAD.left}
-          y1={toY(ema9)}
+          y1={toY(emaMacro)}
           x2={W - PAD.right}
-          y2={toY(ema9)}
-          stroke="#22d3ee"
-          strokeWidth="1"
-          strokeDasharray="2,2"
-          opacity="0.7"
+          y2={toY(emaMacro)}
+          stroke="#06b6d4"
+          strokeWidth="1.5"
+          strokeDasharray="4,2"
+          opacity="0.8"
         />
       )}
-      {ema21 && (
+
+      {/* EMA Inter 50 Line */}
+      {emaInter && (
         <line
           x1={PAD.left}
-          y1={toY(ema21)}
+          y1={toY(emaInter)}
           x2={W - PAD.right}
-          y2={toY(ema21)}
-          stroke="#facc15"
-          strokeWidth="1"
-          strokeDasharray="2,2"
-          opacity="0.7"
+          y2={toY(emaInter)}
+          stroke="#eab308"
+          strokeWidth="1.5"
+          opacity="0.8"
+        />
+      )}
+
+      {/* Gatilho 50% Line */}
+      {gatilhoTaxa50 && (
+        <line
+          x1={PAD.left}
+          y1={toY(gatilhoTaxa50)}
+          x2={W - PAD.right}
+          y2={toY(gatilhoTaxa50)}
+          stroke="#a855f7"
+          strokeWidth="1.5"
+          strokeDasharray="3,3"
+          opacity="0.9"
         />
       )}
 
@@ -1292,6 +1316,11 @@ function CandlestickChart({
         const bodyBot = toY(Math.min(c.open, c.close));
         const bodyH = Math.max(1, bodyBot - bodyTop);
         const xLeft = x - candleW / 2;
+
+        // Match markers for this candle
+        const marker = markers?.find(
+          (m) => Math.abs(m.time - c.time) < 60 || (i === candles.length - 1 && m.type),
+        );
 
         return (
           <g key={c.time}>
@@ -1310,17 +1339,56 @@ function CandlestickChart({
               y={bodyTop}
               width={candleW}
               height={bodyH}
-              fill={isUp ? "#22c55e" : "#ef4444"}
+              fill={color}
               opacity={0.9}
             />
+
+            {/* Custom Strategy Markers on Candles */}
+            {marker && marker.type === "buy" && (
+              <g transform={`translate(${x}, ${toY(c.low) + 12})`}>
+                <polygon points="0,-8 6,4 -6,4" fill="#22c55e" />
+                <text
+                  x="0"
+                  y="12"
+                  fill="#22c55e"
+                  fontSize="7"
+                  fontWeight="bold"
+                  textAnchor="middle"
+                >
+                  JOSE COMPRA
+                </text>
+              </g>
+            )}
+
+            {marker && marker.type === "sell" && (
+              <g transform={`translate(${x}, ${toY(c.high) - 12})`}>
+                <polygon points="0,8 6,-4 -6,-4" fill="#ef4444" />
+                <text
+                  x="0"
+                  y="-8"
+                  fill="#ef4444"
+                  fontSize="7"
+                  fontWeight="bold"
+                  textAnchor="middle"
+                >
+                  JOSE VENDA
+                </text>
+              </g>
+            )}
+
+            {marker && (marker.type === "armed_buy" || marker.type === "armed_sell") && (
+              <circle
+                cx={x}
+                cy={marker.type === "armed_buy" ? toY(c.low) + 8 : toY(c.high) - 8}
+                r="3"
+                fill="#facc15"
+              />
+            )}
           </g>
         );
       })}
 
-      {/* Next candle preview — realistic size & color projected from the broker's
-          real data (average body + amplitude of the recent 1M candles) and the
-          algorithm's direction/strength, drawn at where the next candle will
-          be born (the current forming close) */}
+      {/* Next candle preview */}
       {nextOpen != null && nextDir && (
         (() => {
           const ghostX = toX(n);
@@ -1334,8 +1402,6 @@ function CandlestickChart({
             recent.reduce((s, c) => s + Math.abs(c.close - c.open), 0) /
               recent.length ||
             avgRange * 0.6;
-          // Project a real body (sized from the average) in the predicted
-          // direction, with proportional wicks (from the average amplitude).
           const bodyProj = Math.min(avgBody, avgRange) * (dirUp ? 1 : -1);
           const projClose = nextOpen + bodyProj;
           const projHigh = Math.max(nextOpen, projClose) + avgRange * 0.25;
@@ -1396,25 +1462,21 @@ function CandlestickChart({
 
       {/* Legend */}
       <g transform={`translate(${PAD.left + 4}, ${H - 6})`}>
-        <rect x={0} y={-4} width={8} height={4} fill="#22d3ee" opacity={0.7} />
-        <text x={10} y={0} fill="#22d3ee" fontSize="7" opacity={0.7}>
-          EMA9
+        <line x1={0} y1={-2} x2={10} y2={-2} stroke="#06b6d4" strokeWidth="2" strokeDasharray="3,1" />
+        <text x={14} y={1} fill="#06b6d4" fontSize="7" fontWeight="bold">
+          EMA Macro (100)
         </text>
-        <rect x={40} y={-4} width={8} height={4} fill="#facc15" opacity={0.7} />
-        <text x={50} y={0} fill="#facc15" fontSize="7" opacity={0.7}>
-          EMA21
+        <line x1={80} y1={-2} x2={90} y2={-2} stroke="#eab308" strokeWidth="2" />
+        <text x={94} y={1} fill="#eab308" fontSize="7" fontWeight="bold">
+          EMA Inter (50)
         </text>
-        <rect x={80} y={-4} width={8} height={4} fill="#fb923c" opacity={0.7} />
-        <text x={90} y={0} fill="#fb923c" fontSize="7" opacity={0.7}>
-          BB Sup
+        <line x1={155} y1={-2} x2={165} y2={-2} stroke="#a855f7" strokeWidth="2" strokeDasharray="2,2" />
+        <text x={169} y={1} fill="#a855f7" fontSize="7" fontWeight="bold">
+          Taxa 50%
         </text>
-        <rect x={120} y={-4} width={8} height={4} fill="#60a5fa" opacity={0.7} />
-        <text x={130} y={0} fill="#60a5fa" fontSize="7" opacity={0.7}>
-          BB Inf
-        </text>
-        <rect x={0} y={8} width={8} height={4} fill="#f59e0b" opacity={0.8} />
-        <text x={10} y={12} fill="#f59e0b" fontSize="7" opacity={0.9} fontWeight="bold">
-          PRÓXIMA (probabilidade calculada)
+        <polygon points="220,-4 224,2 216,2" fill="#22c55e" />
+        <text x={228} y={1} fill="#22c55e" fontSize="7" fontWeight="bold">
+          Sinal TAXA3
         </text>
       </g>
     </svg>
