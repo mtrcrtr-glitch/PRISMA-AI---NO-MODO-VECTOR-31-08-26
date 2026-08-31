@@ -1,14 +1,20 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 
-import { OTC_ASSETS } from "#/lib/otc-assets.ts";
-import { fetchAccount, scanAssets, executeOrder } from "#/lib/otc.functions.ts";
+import { OTC_ASSETS, type OtcAsset } from "#/lib/otc-assets.ts";
+import { fetchAccount, fetchAssets, scanAssets, executeOrder } from "#/lib/otc.functions.ts";
 import { sorosProgression } from "#/lib/analysis.ts";
 
 export const Route = createFileRoute("/scanner")({
   loader: async () => {
-    const account = await fetchAccount().catch(() => null);
-    return { account };
+    const [accountRes, assetsRes] = await Promise.allSettled([
+      fetchAccount(),
+      fetchAssets(),
+    ]);
+    return {
+      account: accountRes.status === "fulfilled" ? accountRes.value : null,
+      assets: assetsRes.status === "fulfilled" && assetsRes.value.length > 0 ? assetsRes.value : OTC_ASSETS,
+    };
   },
   component: ScannerPage,
 });
@@ -48,12 +54,20 @@ interface ExecLog {
 }
 
 function ScannerPage() {
-  const { account } = Route.useLoaderData();
+  const { account, assets } = Route.useLoaderData();
+  const assetList: (OtcAsset & { payout?: number })[] =
+    assets && assets.length > 0 ? assets : OTC_ASSETS;
 
   // Asset selection
   const [selectedIds, setSelectedIds] = useState<number[]>(
-    OTC_ASSETS.slice(0, 5).map((a) => a.id),
+    assetList.slice(0, 8).map((a) => a.id),
   );
+
+  // Filter & Search
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState<
+    "all" | "forex" | "crypto" | "stock" | "commodity" | "index"
+  >("all");
 
   // Scanner state
   const [scanning, setScanning] = useState(false);
@@ -81,12 +95,54 @@ function ScannerPage() {
   const [execLog, setExecLog] = useState<ExecLog[]>([]);
   const [executing, setExecuting] = useState(false);
 
-  const assetById = Object.fromEntries(OTC_ASSETS.map((a) => [a.id, a]));
+  const assetById = Object.fromEntries(assetList.map((a) => [a.id, a]));
+
+  const filteredAssets = assetList.filter((a) => {
+    const matchesCat = selectedCategory === "all" || a.category === selectedCategory;
+    if (!matchesCat) return false;
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase().trim();
+    return (
+      a.symbol.toLowerCase().includes(q) ||
+      a.label.toLowerCase().includes(q) ||
+      String(a.id).includes(q)
+    );
+  });
+
+  const categories: { id: "all" | "forex" | "crypto" | "stock" | "commodity" | "index"; label: string; icon: string }[] = [
+    { id: "all", label: "Todos", icon: "🌐" },
+    { id: "forex", label: "Forex", icon: "💱" },
+    { id: "crypto", label: "Cripto", icon: "🪙" },
+    { id: "stock", label: "Ações", icon: "📈" },
+    { id: "commodity", label: "Commodities", icon: "🛢️" },
+    { id: "index", label: "Índices", icon: "📊" },
+  ];
 
   function toggleAsset(id: number) {
     setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : prev.length < 10 ? [...prev, id] : prev,
+      prev.includes(id)
+        ? prev.filter((x) => x !== id)
+        : prev.length < 30
+          ? [...prev, id]
+          : prev,
     );
+  }
+
+  function selectAllFiltered() {
+    const idsToAdd = filteredAssets.slice(0, 30).map((a) => a.id);
+    setSelectedIds(idsToAdd);
+  }
+
+  function selectTopPayouts() {
+    const topIds = [...assetList]
+      .sort((a, b) => (b.payout ?? 85) - (a.payout ?? 85))
+      .slice(0, 15)
+      .map((a) => a.id);
+    setSelectedIds(topIds);
+  }
+
+  function clearSelection() {
+    setSelectedIds([]);
   }
 
   async function runScan() {
@@ -287,53 +343,152 @@ function ScannerPage() {
           {/* Asset selector */}
           <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-              <span className="text-sm font-semibold">Ativos para monitorar</span>
-              <span className="text-xs text-gray-500">
-                {selectedIds.length}/10 selecionados
+              <div>
+                <span className="text-sm font-semibold">Ativos para monitorar</span>
+                <p className="text-[11px] text-gray-500">{assetList.length} ativos OTC disponíveis</p>
+              </div>
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${selectedIds.length > 0 ? "bg-emerald-950 text-emerald-300 border border-emerald-800" : "bg-gray-800 text-gray-400"}`}>
+                {selectedIds.length}/30 ativos
               </span>
             </div>
-            <div className="p-2 max-h-64 overflow-y-auto">
-              {OTC_ASSETS.map((asset) => {
-                const selected = selectedIds.includes(asset.id);
-                const strength = strengths[asset.id];
-                return (
+
+            {/* Search & Category filter */}
+            <div className="p-3 border-b border-gray-800 space-y-2 bg-gray-900/60">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Filtrar por moeda, ação..."
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500"
+                />
+                <span className="absolute left-2 top-2 text-xs text-gray-500">🔍</span>
+                {searchQuery && (
                   <button
-                    key={asset.id}
-                    onClick={() => toggleAsset(asset.id)}
-                    className={`w-full text-left px-3 py-2 rounded-lg mb-0.5 flex items-center justify-between transition-colors ${
-                      selected
-                        ? "bg-emerald-900/30 border border-emerald-700/50"
-                        : "hover:bg-gray-800 border border-transparent"
+                    onClick={() => setSearchQuery("")}
+                    className="absolute right-2 top-1.5 text-xs text-gray-400 hover:text-white"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
+
+              {/* Categories */}
+              <div className="flex gap-1 overflow-x-auto pb-1 scrollbar-none text-[10px]">
+                {categories.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setSelectedCategory(c.id)}
+                    className={`px-2 py-0.5 rounded font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${
+                      selectedCategory === c.id
+                        ? "bg-emerald-500 text-black font-bold"
+                        : "bg-gray-800 text-gray-400 hover:text-white"
                     }`}
                   >
-                    <div className="flex items-center gap-2">
-                      <div
-                        className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-colors ${
-                          selected
-                            ? "bg-emerald-500 border-emerald-500"
-                            : "border-gray-600"
-                        }`}
-                      >
-                        {selected && <span className="text-black text-xs font-bold">✓</span>}
-                      </div>
-                      <span className="text-sm text-gray-200">{asset.label}</span>
-                    </div>
-                    {strength !== undefined && (
-                      <span
-                        className={`text-xs font-semibold ${
-                          strength >= 75
-                            ? "text-emerald-400"
-                            : strength >= 60
-                              ? "text-yellow-400"
-                              : "text-gray-500"
-                        }`}
-                      >
-                        {strength}%
-                      </span>
-                    )}
+                    <span>{c.icon}</span>
+                    <span>{c.label}</span>
                   </button>
-                );
-              })}
+                ))}
+              </div>
+
+              {/* Quick actions */}
+              <div className="flex gap-1 pt-1 text-[10px]">
+                <button
+                  onClick={selectAllFiltered}
+                  className="flex-1 bg-gray-800 hover:bg-gray-750 text-gray-300 py-1 rounded border border-gray-700 transition-colors"
+                >
+                  + Selecionar exibidos ({Math.min(filteredAssets.length, 30)})
+                </button>
+                <button
+                  onClick={selectTopPayouts}
+                  className="flex-1 bg-emerald-950/80 hover:bg-emerald-900 text-emerald-300 py-1 rounded border border-emerald-800/60 transition-colors"
+                >
+                  ⚡ Top Payouts
+                </button>
+                <button
+                  onClick={clearSelection}
+                  className="px-2 bg-gray-800 hover:bg-gray-750 text-gray-400 hover:text-red-400 py-1 rounded border border-gray-700 transition-colors"
+                  title="Limpar"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="p-2 max-h-72 overflow-y-auto divide-y divide-gray-800/30">
+              {filteredAssets.length === 0 ? (
+                <div className="p-4 text-center text-xs text-gray-500">
+                  Nenhum ativo encontrado.
+                </div>
+              ) : (
+                filteredAssets.map((asset) => {
+                  const selected = selectedIds.includes(asset.id);
+                  const strength = strengths[asset.id];
+                  const catIcon =
+                    asset.category === "crypto"
+                      ? "🪙"
+                      : asset.category === "stock"
+                        ? "📈"
+                        : asset.category === "commodity"
+                          ? "🛢️"
+                          : asset.category === "index"
+                            ? "📊"
+                            : "💱";
+
+                  return (
+                    <button
+                      key={asset.id}
+                      onClick={() => toggleAsset(asset.id)}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg mb-0.5 flex items-center justify-between transition-colors ${
+                        selected
+                          ? "bg-emerald-950/60 border border-emerald-700/60 text-white"
+                          : "hover:bg-gray-800/60 border border-transparent text-gray-300"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div
+                          className={`w-3.5 h-3.5 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+                            selected
+                              ? "bg-emerald-500 border-emerald-500"
+                              : "border-gray-600 bg-gray-800"
+                          }`}
+                        >
+                          {selected && <span className="text-black text-[9px] font-bold">✓</span>}
+                        </div>
+                        <span className="text-xs opacity-75">{catIcon}</span>
+                        <div className="min-w-0">
+                          <span className="text-xs font-medium truncate block">
+                            {asset.label.replace(" OTC", "")}
+                          </span>
+                          <span className="text-[10px] text-gray-500 font-mono">
+                            ID {asset.id}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        {asset.payout && (
+                          <span className="text-[10px] font-mono text-gray-400 bg-gray-800 px-1 py-0.2 rounded">
+                            {asset.payout}%
+                          </span>
+                        )}
+                        {strength !== undefined && (
+                          <span
+                            className={`text-xs font-bold ${
+                              strength >= 75
+                                ? "text-emerald-400"
+                                : strength >= 60
+                                  ? "text-yellow-400"
+                                  : "text-gray-500"
+                            }`}
+                          >
+                            {strength}%
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })
+              )}
             </div>
           </div>
 

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { analyze } from "#/lib/analysis.ts";
 import {
   getAccount,
+  getBrokerOtcActives,
   getCandles,
   getPayouts,
   getSsid,
@@ -153,6 +154,15 @@ export const connectWithSsid = createServerFn({ method: "POST" })
 // ─── Assets list ─────────────────────────────────────────────────────────────
 
 export const fetchAssets = createServerFn({ method: "GET" }).handler(async () => {
+  try {
+    const liveActives = await getBrokerOtcActives();
+    if (liveActives && liveActives.length > 0) {
+      return liveActives;
+    }
+  } catch {
+    // fallback
+  }
+
   let payouts: Record<number, number> = {};
   try {
     const ids = OTC_ASSETS.map((a) => a.id);
@@ -163,7 +173,8 @@ export const fetchAssets = createServerFn({ method: "GET" }).handler(async () =>
 
   return OTC_ASSETS.map((a) => ({
     ...a,
-    payout: payouts[a.id] ?? 85,
+    payout: payouts[a.id] ?? a.payout ?? 85,
+    enabled: true,
   }));
 });
 

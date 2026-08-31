@@ -22,14 +22,47 @@ export const Route = createFileRoute("/")({
 
 function HomePage() {
   const { assets, account, conn } = Route.useLoaderData();
+  const searchParams = Route.useSearch();
   const navigate = useNavigate();
   const router = useRouter();
+
+  const currentAssetId =
+    searchParams && "asset" in (searchParams as Record<string, unknown>)
+      ? Number((searchParams as Record<string, string>).asset)
+      : assets[0]?.id ?? 76;
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState<
+    "all" | "forex" | "crypto" | "stock" | "commodity" | "index"
+  >("all");
 
   const connOk = conn?.ok === true;
   const connAccount = connOk
     ? (conn as { ok: true; account: { name: string; balance: number; demoBalance: number; currency: string } }).account
     : null;
   const displayAccount = connAccount ?? account;
+
+  // Filter assets
+  const filteredAssets = assets.filter((a) => {
+    const matchesCat = selectedCategory === "all" || a.category === selectedCategory;
+    if (!matchesCat) return false;
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase().trim();
+    return (
+      a.symbol.toLowerCase().includes(q) ||
+      a.label.toLowerCase().includes(q) ||
+      String(a.id).includes(q)
+    );
+  });
+
+  const categories: { id: "all" | "forex" | "crypto" | "stock" | "commodity" | "index"; label: string; icon: string }[] = [
+    { id: "all", label: "Todos", icon: "🌐" },
+    { id: "forex", label: "Forex", icon: "💱" },
+    { id: "crypto", label: "Cripto", icon: "🪙" },
+    { id: "stock", label: "Ações", icon: "📈" },
+    { id: "commodity", label: "Commodities", icon: "🛢️" },
+    { id: "index", label: "Índices", icon: "📊" },
+  ];
 
   return (
     <div className="min-h-screen bg-gray-950 text-white flex flex-col">
@@ -65,31 +98,38 @@ function HomePage() {
       {/* Header */}
       <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur px-4 py-3 flex items-center justify-between sticky top-0 z-50">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-sm text-black">
+          <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-sm text-black shadow-lg shadow-emerald-500/20">
             R
           </div>
-          <span className="font-bold text-lg tracking-tight">RoboSignal OTC</span>
-          <span className={`text-xs px-2 py-0.5 rounded-full border ${connOk ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30" : "bg-red-500/20 text-red-400 border-red-500/30"}`}>
-            {connOk ? "AO VIVO" : "OFFLINE"}
-          </span>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-lg tracking-tight">RoboSignal OTC</span>
+              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${connOk ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30" : "bg-red-500/20 text-red-400 border-red-500/30"}`}>
+                {connOk ? "AO VIVO · CORRETORA" : "OFFLINE"}
+              </span>
+            </div>
+            <p className="text-[11px] text-gray-400 hidden sm:block">
+              {assets.length} Ativos OTC em Tempo Real · Taxa Dividida v3
+            </p>
+          </div>
         </div>
         {displayAccount && (
           <div className="flex items-center gap-3 text-sm">
-            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
-              <span className="text-gray-400">Demo</span>
+            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg border border-gray-700/50">
+              <span className="text-gray-400 text-xs">Demo</span>
               <span className="font-semibold text-emerald-400">
                 ${displayAccount.demoBalance.toFixed(2)}
               </span>
             </div>
-            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
-              <span className="text-gray-400">Real</span>
+            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg border border-gray-700/50">
+              <span className="text-gray-400 text-xs">Real</span>
               <span className="font-semibold text-yellow-400">
                 ${displayAccount.balance.toFixed(2)}
               </span>
             </div>
-            <div className="flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
+            <div className="flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg border border-gray-700/50">
               <div className={`w-2 h-2 rounded-full ${connOk ? "bg-emerald-400 animate-pulse" : "bg-red-400"}`} />
-              <span className="text-gray-300 text-xs">{displayAccount.name.split(" ")[0]}</span>
+              <span className="text-gray-300 text-xs font-medium">{displayAccount.name.split(" ")[0]}</span>
             </div>
           </div>
         )}
@@ -100,43 +140,97 @@ function HomePage() {
         <div className="flex gap-1">
           <button
             onClick={() => void navigate({ to: "/" })}
-            className="px-4 py-2.5 text-sm font-medium text-emerald-400 border-b-2 border-emerald-400"
+            className="px-4 py-2.5 text-sm font-medium text-emerald-400 border-b-2 border-emerald-400 flex items-center gap-1.5"
           >
-            📊 OTC ao Vivo
+            <span>📊 OTC ao Vivo</span>
+            <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-950 text-emerald-300 font-bold border border-emerald-800">
+              {assets.length}
+            </span>
           </button>
           <button
             onClick={() => void navigate({ to: "/scanner" })}
-            className="px-4 py-2.5 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent hover:border-gray-600 transition-colors"
+            className="px-4 py-2.5 text-sm font-medium text-gray-400 hover:text-white border-b-2 border-transparent hover:border-gray-600 transition-colors flex items-center gap-1.5"
           >
-            🔍 Auto Scanner
+            <span>🔍 Auto Scanner</span>
           </button>
         </div>
       </nav>
 
       {/* Main content */}
       <div className="flex flex-1 min-h-0">
-        {/* Sidebar - asset list */}
-        <aside className="w-56 lg:w-64 border-r border-gray-800 bg-gray-900/40 overflow-y-auto flex-shrink-0">
-          <div className="p-3 border-b border-gray-800">
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider">
-              Ativos OTC ({assets.length})
-            </p>
+        {/* Sidebar - asset list with search and categories */}
+        <aside className="w-64 lg:w-72 border-r border-gray-800 bg-gray-900/40 flex flex-col flex-shrink-0">
+          {/* Search bar */}
+          <div className="p-3 border-b border-gray-800/80 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-gray-400 font-semibold uppercase tracking-wider">
+                Catálogo OTC
+              </span>
+              <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-300 font-mono">
+                {filteredAssets.length}/{assets.length}
+              </span>
+            </div>
+
+            <div className="relative">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Buscar par, ação, crypto..."
+                className="w-full bg-gray-800/90 border border-gray-700/80 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500"
+              />
+              <span className="absolute left-2.5 top-2 text-xs text-gray-500">🔍</span>
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery("")}
+                  className="absolute right-2.5 top-1.5 text-xs text-gray-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
+            {/* Category pills */}
+            <div className="flex gap-1 overflow-x-auto pb-1 scrollbar-none text-[11px]">
+              {categories.map((c) => {
+                const count =
+                  c.id === "all"
+                    ? assets.length
+                    : assets.filter((a) => a.category === c.id).length;
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => setSelectedCategory(c.id)}
+                    className={`px-2 py-1 rounded-md font-medium whitespace-nowrap transition-colors flex items-center gap-1 ${
+                      selectedCategory === c.id
+                        ? "bg-emerald-500 text-black font-bold shadow"
+                        : "bg-gray-800 text-gray-400 hover:text-gray-200 hover:bg-gray-750"
+                    }`}
+                  >
+                    <span>{c.icon}</span>
+                    <span>{c.label}</span>
+                    <span className="opacity-75 text-[10px]">({count})</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-          <div className="py-1">
-            {["forex", "stock", "crypto"].map((cat) => {
-              const catAssets = assets.filter((a) => a.category === cat);
-              if (!catAssets.length) return null;
-              return (
-                <div key={cat}>
-                  <div className="px-3 py-1.5 text-xs text-gray-500 uppercase font-semibold tracking-wider">
-                    {cat === "forex" ? "💱 Forex" : cat === "stock" ? "📈 Ações" : "🪙 Crypto"}
-                  </div>
-                  {catAssets.map((asset) => (
-                    <AssetRow key={asset.id} asset={asset} />
-                  ))}
-                </div>
-              );
-            })}
+
+          {/* List of assets */}
+          <div className="flex-1 overflow-y-auto divide-y divide-gray-800/40">
+            {filteredAssets.length === 0 ? (
+              <div className="p-6 text-center text-xs text-gray-500">
+                Nenhum ativo encontrado para &quot;{searchQuery}&quot;
+              </div>
+            ) : (
+              filteredAssets.map((asset) => (
+                <AssetRow
+                  key={asset.id}
+                  asset={asset}
+                  selected={asset.id === currentAssetId}
+                />
+              ))
+            )}
           </div>
         </aside>
 
@@ -243,8 +337,26 @@ function SsidConnectPanel({ onConnected }: { onConnected: () => void }) {
   );
 }
 
-function AssetRow({ asset }: { asset: OtcAsset & { payout: number } }) {
+function AssetRow({
+  asset,
+  selected,
+}: {
+  asset: OtcAsset & { payout: number };
+  selected: boolean;
+}) {
   const navigate = useNavigate();
+
+  const catIcon =
+    asset.category === "crypto"
+      ? "🪙"
+      : asset.category === "stock"
+        ? "📈"
+        : asset.category === "commodity"
+          ? "🛢️"
+          : asset.category === "index"
+            ? "📊"
+            : "💱";
+
   return (
     <button
       onClick={() =>
@@ -253,15 +365,40 @@ function AssetRow({ asset }: { asset: OtcAsset & { payout: number } }) {
           search: (prev: Record<string, string>) => ({ ...prev, asset: String(asset.id) }),
         })
       }
-      className="w-full text-left px-3 py-2 hover:bg-gray-800/60 transition-colors flex items-center justify-between group"
+      className={`w-full text-left px-3 py-2 transition-all flex items-center justify-between group ${
+        selected
+          ? "bg-emerald-950/70 border-l-4 border-emerald-400 pl-2"
+          : "hover:bg-gray-800/60 border-l-4 border-transparent"
+      }`}
     >
-      <div>
-        <p className="text-sm font-medium text-gray-200 group-hover:text-white leading-none">
-          {asset.label.replace(" OTC", "")}
-        </p>
-        <p className="text-xs text-gray-500 mt-0.5">OTC</p>
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-xs opacity-75">{catIcon}</span>
+        <div className="min-w-0">
+          <p
+            className={`text-xs font-semibold truncate leading-tight ${
+              selected ? "text-emerald-300" : "text-gray-200 group-hover:text-white"
+            }`}
+          >
+            {asset.label.replace(" OTC", "")}
+          </p>
+          <p className="text-[10px] text-gray-500 flex items-center gap-1">
+            <span>OTC</span>
+            <span>·</span>
+            <span className="font-mono">ID {asset.id}</span>
+          </p>
+        </div>
       </div>
-      <span className="text-xs text-emerald-400 font-medium">{asset.payout}%</span>
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        <span
+          className={`text-[11px] px-1.5 py-0.5 rounded font-bold ${
+            asset.payout >= 88
+              ? "bg-emerald-900/60 text-emerald-300 border border-emerald-700/50"
+              : "bg-gray-800 text-gray-300"
+          }`}
+        >
+          {asset.payout}%
+        </span>
+      </div>
     </button>
   );
 }

@@ -394,6 +394,150 @@ export async function getAccount(): Promise<AccountInfo> {
   });
 }
 
+// ─── Real-Time Broker OTC Assets ─────────────────────────────────────────────
+
+export interface BrokerOtcAsset {
+  id: number;
+  symbol: string;
+  label: string;
+  category: "forex" | "stock" | "crypto" | "commodity" | "index";
+  payout: number;
+  precision: number;
+  image?: string;
+  enabled: boolean;
+}
+
+let cachedBrokerActives: BrokerOtcAsset[] | null = null;
+let cachedBrokerActivesAt = 0;
+const ACTIVES_CACHE_TTL = 60 * 1000; // 60 seconds
+
+export async function getBrokerOtcActives(): Promise<BrokerOtcAsset[]> {
+  const now = Date.now();
+  if (cachedBrokerActives && now - cachedBrokerActivesAt < ACTIVES_CACHE_TTL) {
+    return cachedBrokerActives;
+  }
+
+  try {
+    const list = await withBrokerWs(async (session) => {
+      const res = await session.sendReq(
+        {
+          name: "get-initialization-data",
+          version: "3.0",
+          body: {},
+        },
+        7000,
+      );
+
+      const msg = (res.msg ?? {}) as Record<string, unknown>;
+      const turboActives = (msg.turbo as { actives?: Record<string, Record<string, unknown>> })?.actives ?? {};
+      const binaryActives = (msg.binary as { actives?: Record<string, Record<string, unknown>> })?.actives ?? {};
+      const allActives = { ...binaryActives, ...turboActives };
+
+      const extracted: BrokerOtcAsset[] = [];
+
+      for (const [idStr, act] of Object.entries(allActives)) {
+        if (!act || act.enabled === false) continue;
+        const id = parseInt(idStr, 10);
+        if (isNaN(id)) continue;
+
+        const rawName = String(act.name ?? act.description ?? "");
+        const rawDesc = String(act.description ?? act.name ?? "");
+        const name = rawName.replace(/^front\./, "");
+        const desc = rawDesc.replace(/^front\./, "");
+
+        const isOtc =
+          name.toUpperCase().includes("OTC") ||
+          desc.toUpperCase().includes("OTC") ||
+          act.provider === "OTC" ||
+          act.is_active_otc === true;
+
+        if (!isOtc) continue;
+
+        let category: "forex" | "stock" | "crypto" | "commodity" | "index" = "forex";
+        const gid = Number(act.group_id ?? 0);
+
+        if (gid === 1) category = "forex";
+        else if (gid === 16) category = "crypto";
+        else if (gid === 3) category = "commodity";
+        else if (gid === 4) category = "index";
+        else if (gid === 2 || (gid >= 5 && gid <= 15) || (gid >= 25 && gid <= 46)) category = "stock";
+        else {
+          if (
+            name.includes("BTC") ||
+            name.includes("ETH") ||
+            name.includes("SOL") ||
+            name.includes("XRP") ||
+            name.includes("DOGE") ||
+            name.includes("ADA")
+          ) {
+            category = "crypto";
+          } else if (
+            name.includes("XAU") ||
+            name.includes("XAG") ||
+            name.includes("OIL") ||
+            name.includes("UKO") ||
+            name.includes("USO") ||
+            name.includes("XNG") ||
+            name.includes("XPT")
+          ) {
+            category = "commodity";
+          } else if (
+            name.includes("USD") ||
+            name.includes("EUR") ||
+            name.includes("JPY") ||
+            name.includes("GBP") ||
+            name.includes("CHF") ||
+            name.includes("CAD") ||
+            name.includes("AUD") ||
+            name.includes("NZD")
+          ) {
+            category = "forex";
+          } else {
+            category = "stock";
+          }
+        }
+
+        const optProfit = (act.option as { profit?: { commission?: number } })?.profit;
+        const commission = Number(optProfit?.commission ?? 12);
+        const payout = Math.max(10, Math.min(99, 100 - commission));
+
+        let cleanSymbol = name.replace(/\s*\(OTC\)/i, "").replace(/-OTC/i, "").trim();
+        if (!cleanSymbol.toUpperCase().includes("OTC")) cleanSymbol += " OTC";
+
+        let cleanLabel = desc.replace(/\s*\(OTC\)/i, "").replace(/-OTC/i, "").trim();
+        if (!cleanLabel.toUpperCase().includes("OTC")) cleanLabel += " OTC";
+
+        extracted.push({
+          id,
+          symbol: cleanSymbol,
+          label: cleanLabel,
+          category,
+          payout,
+          precision: Number(act.precision ?? 5),
+          image: typeof act.image === "string" ? `https://trade.optgobroker.com${act.image}` : undefined,
+          enabled: true,
+        });
+      }
+
+      extracted.sort(
+        (a, b) => a.category.localeCompare(b.category) || a.symbol.localeCompare(b.symbol),
+      );
+
+      return extracted;
+    });
+
+    if (list.length > 0) {
+      cachedBrokerActives = list;
+      cachedBrokerActivesAt = now;
+      return list;
+    }
+  } catch {
+    // If WS call fails, return null to allow fallback
+  }
+
+  return cachedBrokerActives ?? [];
+}
+
 // ─── Payout ──────────────────────────────────────────────────────────────────
 
 export async function getPayouts(activeIds: number[]): Promise<Record<number, number>> {
