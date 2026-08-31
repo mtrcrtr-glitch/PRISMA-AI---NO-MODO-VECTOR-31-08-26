@@ -18,19 +18,7 @@ import { OTC_ASSETS } from "#/lib/otc-assets.ts";
 // ─── Connection test / diagnostics ───────────────────────────────────────────
 
 export const testConnection = createServerFn({ method: "GET" }).handler(async () => {
-  const email = process.env["OPTGO_BROKER_EMAIL"] ?? "";
-  const password = process.env["OPTGO_BROKER_PASSWORD"] ?? "";
-
-  if (!email || !password) {
-    return {
-      ok: false,
-      stage: "config",
-      message: "Credenciais não configuradas",
-      detail: "OPTGO_BROKER_EMAIL ou OPTGO_BROKER_PASSWORD ausentes",
-    };
-  }
-
-  // Step 0: If a live SSID override is set (from the site session), use it directly
+  // Step 0: If a live SSID override is set (from the site session or env), try it first
   const override = getSsidOverride();
   if (override) {
     try {
@@ -38,7 +26,7 @@ export const testConnection = createServerFn({ method: "GET" }).handler(async ()
       return {
         ok: true,
         stage: "ssid",
-        message: "Conectado com a sua sessão!",
+        message: "Conectado com sucesso!",
         detail: `Conta: ${account.name}`,
         account: {
           name: account.name,
@@ -47,14 +35,21 @@ export const testConnection = createServerFn({ method: "GET" }).handler(async ()
           currency: account.currency,
         },
       };
-    } catch (err) {
-      return {
-        ok: false,
-        stage: "websocket",
-        message: "Sessão SSID expirada",
-        detail: err instanceof Error ? err.message : "Erro desconhecido",
-      };
+    } catch {
+      // If override failed, continue to fallback on REST credentials if available
     }
+  }
+
+  const email = process.env["OPTGO_BROKER_EMAIL"] ?? "";
+  const password = process.env["OPTGO_BROKER_PASSWORD"] ?? "";
+
+  if (!email || !password) {
+    return {
+      ok: false,
+      stage: "config",
+      message: "Credenciais não configuradas",
+      detail: "Configure suas credenciais ou conecte com o SSID da sua sessão",
+    };
   }
 
   // Step 1: Test REST login
