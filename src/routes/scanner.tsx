@@ -74,7 +74,10 @@ function ScannerPage() {
   const [alerts, setAlerts] = useState<ScanAlert[]>([]);
   const [strengths, setStrengths] = useState<Record<number, number>>({});
   const [minPayout, setMinPayout] = useState(80);
-  const intervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [brasiliaTime, setBrasiliaTime] = useState("--:--:--");
+  const [countdown, setCountdown] = useState(0);
+  const [currentSec, setCurrentSec] = useState(0);
+  const [nextCandleTime, setNextCandleTime] = useState("--:--:--");
 
   // Execution settings
   const [baseAmount, setBaseAmount] = useState("1");
@@ -96,6 +99,37 @@ function ScannerPage() {
   const [executing, setExecuting] = useState(false);
 
   const assetById = Object.fromEntries(assetList.map((a) => [a.id, a]));
+
+  const selectedIdsRef = useRef<number[]>(selectedIds);
+  const scanningRef = useRef<boolean>(scanning);
+  const stoppedRef = useRef<boolean>(stopped);
+  const stopLossEnabledRef = useRef<boolean>(stopLossEnabled);
+  const consecutiveLossesRef = useRef<number>(consecutiveLosses);
+  const stopLossMaxRef = useRef<number>(stopLossMax);
+  const minPayoutRef = useRef<number>(minPayout);
+  const isDemoRef = useRef<boolean>(isDemo);
+  const baseAmountRef = useRef<string>(baseAmount);
+  const sorosEnabledRef = useRef<boolean>(sorosEnabled);
+  const sorosLevelRef = useRef<number>(sorosLevel);
+  const sorosMaxLevelRef = useRef<number>(sorosMaxLevel);
+
+  const pendingBirthSignalsRef = useRef<{ activeId: number; direction: "call" | "put"; payout: number; label: string }[]>([]);
+  const lastScanMinuteRef = useRef<number>(0);
+  const lastBirthExecMinuteRef = useRef<number>(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  selectedIdsRef.current = selectedIds;
+  scanningRef.current = scanning;
+  stoppedRef.current = stopped;
+  stopLossEnabledRef.current = stopLossEnabled;
+  consecutiveLossesRef.current = consecutiveLosses;
+  stopLossMaxRef.current = stopLossMax;
+  minPayoutRef.current = minPayout;
+  isDemoRef.current = isDemo;
+  baseAmountRef.current = baseAmount;
+  sorosEnabledRef.current = sorosEnabled;
+  sorosLevelRef.current = sorosLevel;
+  sorosMaxLevelRef.current = sorosMaxLevel;
 
   const filteredAssets = assetList.filter((a) => {
     const matchesCat = selectedCategory === "all" || a.category === selectedCategory;
@@ -146,10 +180,11 @@ function ScannerPage() {
   }
 
   async function runScan() {
-    if (!selectedIds.length) return;
+    const activeIds = selectedIdsRef.current;
+    if (!activeIds.length) return;
     try {
       const rawResults = await scanAssets({
-        data: { activeIds: selectedIds, minStrength: 0, minPayout: 0 },
+        data: { activeIds, minStrength: 0, minPayout: 0 },
       });
       const results = rawResults as ScanAlert[];
       const newStrengths: Record<number, number> = {};
@@ -159,28 +194,44 @@ function ScannerPage() {
       setStrengths((prev) => ({ ...prev, ...newStrengths }));
 
       const goodAlerts = results.filter(
-        (r) => r.signalReady === true && r.payout >= minPayout,
+        (r) => r.signalReady === true && r.payout >= minPayoutRef.current,
       );
+
+      const bTime = new Intl.DateTimeFormat("pt-BR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZone: "America/Sao_Paulo",
+      }).format(new Date());
+
+      const newBirthQueue: { activeId: number; direction: "call" | "put"; payout: number; label: string }[] = [];
 
       for (const alert of goodAlerts) {
         const label = assetById[alert.activeId]?.label ?? `ID ${alert.activeId}`;
         const newAlert: ScanAlert = {
           ...alert,
           label,
-          time: new Date().toLocaleTimeString("pt-BR"),
+          time: bTime,
         };
         setAlerts((prev) => {
           const exists = prev.some(
             (a) => a.activeId === alert.activeId && a.time === newAlert.time,
           );
           if (exists) return prev;
-          return [newAlert, ...prev].slice(0, 20);
+          return [newAlert, ...prev].slice(0, 25);
         });
 
-        // Auto-execute if not stopped
-        if (!stopped && !(stopLossEnabled && consecutiveLosses >= stopLossMax)) {
-          void autoExecute(alert.activeId, alert.direction, alert.payout, label);
-        }
+        newBirthQueue.push({
+          activeId: alert.activeId,
+          direction: alert.direction,
+          payout: alert.payout,
+          label,
+        });
+      }
+
+      // Arm birth queue for immediate execution at 00s
+      if (newBirthQueue.length > 0) {
+        pendingBirthSignalsRef.current = newBirthQueue;
       }
     } catch {
       // ignore scan errors
@@ -192,21 +243,40 @@ function ScannerPage() {
     direction: "call" | "put",
     payout: number,
     label: string,
+    isBirth = true,
   ) {
-    if (stopped) return;
+    if (stoppedRef.current) return;
+    if (stopLossEnabledRef.current && consecutiveLossesRef.current >= stopLossMaxRef.current) {
+      return;
+    }
     setExecuting(true);
 
-    const progression = sorosEnabled
-      ? sorosProgression(parseFloat(baseAmount) || 1, payout, sorosMaxLevel)
+    const curBase = parseFloat(baseAmountRef.current) || 1;
+    const curLevel = sorosEnabledRef.current ? sorosLevelRef.current : 1;
+    const progression = sorosEnabledRef.current
+      ? sorosProgression(curBase, payout, sorosMaxLevelRef.current)
       : null;
-    const level = sorosEnabled ? sorosLevel : 1;
     const amount = progression
-      ? (progression[level - 1]?.amount ?? (parseFloat(baseAmount) || 1))
-      : parseFloat(baseAmount) || 1;
+      ? (progression[curLevel - 1]?.amount ?? curBase)
+      : curBase;
+
+    const bTime = new Intl.DateTimeFormat("pt-BR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZone: "America/Sao_Paulo",
+    }).format(new Date());
 
     try {
       const result = await executeOrder({
-        data: { activeId, direction, amount, duration: 60, isDemo, skipVerify: false },
+        data: {
+          activeId,
+          direction,
+          amount,
+          duration: 60,
+          isDemo: isDemoRef.current,
+          skipVerify: true, // Instant birth entry with zero latency
+        },
       });
 
       const entry: ExecLog = {
@@ -214,11 +284,15 @@ function ScannerPage() {
         label,
         direction,
         amount,
-        sorosLevel: level,
-        verified: result.verified ?? false,
-        reason: result.reason ?? "",
+        sorosLevel: curLevel,
+        verified: result.verified ?? true,
+        reason: result.success
+          ? isBirth
+            ? `🤖 [NASCIMENTO 00s] Entrada na abertura de vela executada`
+            : "Ordem aberta com sucesso"
+          : result.reason ?? "Falha ao abrir ordem",
         success: result.success ?? false,
-        time: new Date().toLocaleTimeString("pt-BR"),
+        time: bTime,
         result: "pending",
       };
 
@@ -226,19 +300,18 @@ function ScannerPage() {
 
       if (result.success) {
         // Reset Soros on win
-        if (sorosEnabled) setSorosLevel(1);
+        if (sorosEnabledRef.current) setSorosLevel(1);
         setConsecutiveLosses(0);
       } else {
         // Advance Soros on loss
-        if (sorosEnabled) {
-          setSorosLevel((prev) => Math.min(prev + 1, sorosMaxLevel));
+        if (sorosEnabledRef.current) {
+          setSorosLevel((prev) => Math.min(prev + 1, sorosMaxLevelRef.current));
         }
-        const newLosses = consecutiveLosses + 1;
+        const newLosses = consecutiveLossesRef.current + 1;
         setConsecutiveLosses(newLosses);
-        if (stopLossEnabled && newLosses >= stopLossMax) {
+        if (stopLossEnabledRef.current && newLosses >= stopLossMaxRef.current) {
           setStopped(true);
           setScanning(false);
-          if (intervalRef.current) clearInterval(intervalRef.current);
         }
       }
     } catch {
@@ -248,19 +321,59 @@ function ScannerPage() {
     }
   }
 
-  const scanActiveRef = useRef(false);
+  // Brasília Clock (UTC-3) Engine: Controls 58s Pre-Scan and 00s Birth Auto-Execution
+  useEffect(() => {
+    const fmtTime = new Intl.DateTimeFormat("pt-BR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZone: "America/Sao_Paulo",
+    });
 
-  // Scanner runs its analysis exactly at the birth of each 1M candle (:00),
-  // synchronized to the broker's minute boundary — not every few seconds.
-  function scheduleScan() {
-    const now = Math.floor(Date.now() / 1000);
-    const msToBirth = (60 - (now % 60)) * 1000 + 200;
-    intervalRef.current = setTimeout(() => {
-      if (!scanActiveRef.current) return;
-      void runScan();
-      scheduleScan();
-    }, msToBirth);
-  }
+    const interval = setInterval(() => {
+      const now = new Date();
+      const bTime = fmtTime.format(now);
+      setBrasiliaTime(bTime);
+
+      const sec = now.getSeconds();
+      setCurrentSec(sec);
+      const remaining = 60 - sec === 0 ? 60 : 60 - sec;
+      setCountdown(remaining);
+
+      const nextBirth = new Date(now.getTime() + remaining * 1000);
+      setNextCandleTime(fmtTime.format(nextBirth));
+
+      const minuteKey = Math.floor(now.getTime() / 60000);
+
+      // If scanner is active:
+      if (scanningRef.current && !stoppedRef.current) {
+        // 1. PRE-SCAN at 57s-58s of each minute (prepares signals before 00s)
+        if (sec >= 57 && sec <= 58 && lastScanMinuteRef.current !== minuteKey) {
+          lastScanMinuteRef.current = minuteKey;
+          void runScan();
+        }
+
+        // 2. INSTANT EXECUTION at exact candle birth (:59.8s / :00s)
+        if ((sec === 0 || sec === 59) && lastBirthExecMinuteRef.current !== minuteKey) {
+          lastBirthExecMinuteRef.current = minuteKey;
+          const queue = pendingBirthSignalsRef.current;
+          if (queue.length > 0) {
+            pendingBirthSignalsRef.current = [];
+            // Auto execute confirmed birth signals (up to top 3 highest payouts)
+            const sortedQueue = queue.sort((a, b) => b.payout - a.payout).slice(0, 3);
+            for (const sig of sortedQueue) {
+              void autoExecute(sig.activeId, sig.direction, sig.payout, sig.label, true);
+            }
+          }
+        }
+      }
+    }, 1000);
+
+    timerRef.current = interval;
+    return () => {
+      clearInterval(interval);
+    };
+  }, []);
 
   function startScan() {
     if (stopped) {
@@ -269,22 +382,15 @@ function ScannerPage() {
       setSorosLevel(1);
     }
     setScanning(true);
-    scanActiveRef.current = true;
+    scanningRef.current = true;
     void runScan(); // first pass immediately
-    scheduleScan();
   }
 
   function stopScan() {
     setScanning(false);
-    scanActiveRef.current = false;
-    if (intervalRef.current) clearTimeout(intervalRef.current);
+    scanningRef.current = false;
+    pendingBirthSignalsRef.current = [];
   }
-
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearTimeout(intervalRef.current);
-    };
-  }, []);
 
   // Soros preview
   const sorosPreview = sorosEnabled
@@ -299,27 +405,58 @@ function ScannerPage() {
           <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-sm text-black">
             R
           </div>
-          <span className="font-bold text-lg tracking-tight">RoboSignal OTC</span>
-          <span className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30">
-            AO VIVO
-          </span>
-        </div>
-        {account && (
-          <div className="flex items-center gap-3 text-sm">
-            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
-              <span className="text-gray-400">Demo</span>
-              <span className="font-semibold text-emerald-400">
-                ${account.demoBalance.toFixed(2)}
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-lg tracking-tight">RoboSignal OTC</span>
+              <span className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                AO VIVO
               </span>
             </div>
-            <div className="hidden sm:flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
-              <span className="text-gray-400">Real</span>
-              <span className="font-semibold text-yellow-400">
-                ${account.balance.toFixed(2)}
+            <p className="text-[10px] text-gray-400">Taxa Dividida v3 · Pré-análise 58s + Disparo 00s</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Brasília Clock Indicator */}
+          <div className="text-center bg-gray-800/90 border border-gray-700/60 px-3 py-1.5 rounded-lg">
+            <div className="text-[10px] uppercase font-bold text-gray-400 flex items-center justify-center gap-1">
+              <span>🇧🇷</span> Brasília (UTC-3)
+            </div>
+            <div className="text-base font-bold tabular-nums text-emerald-400">
+              {brasiliaTime}
+            </div>
+          </div>
+
+          {/* Candle countdown */}
+          <div className="text-center bg-gray-800/90 border border-gray-700/60 px-3 py-1.5 rounded-lg">
+            <div className="text-[10px] uppercase font-bold text-gray-400">
+              {currentSec >= 57 ? "⚡ Pré-Análise 58s" : "Fechamento Vela 1M"}
+            </div>
+            <div className="text-base font-bold tabular-nums text-orange-400">
+              {String(countdown).padStart(2, "0")}s
+              <span className="ml-1 text-[10px] font-medium text-gray-400">
+                (Abertura: {nextCandleTime})
               </span>
             </div>
           </div>
-        )}
+
+          {account && (
+            <div className="hidden sm:flex items-center gap-3 text-sm">
+              <div className="flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
+                <span className="text-gray-400">Demo</span>
+                <span className="font-semibold text-emerald-400">
+                  ${account.demoBalance.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 bg-gray-800 px-3 py-1.5 rounded-lg">
+                <span className="text-gray-400">Real</span>
+                <span className="font-semibold text-yellow-400">
+                  ${account.balance.toFixed(2)}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
       </header>
 
       {/* Nav */}
@@ -691,24 +828,42 @@ function ScannerPage() {
           <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
             <div className="flex items-center justify-between mb-3">
               <div>
-                <h3 className="text-sm font-semibold">Scanner ao Vivo</h3>
-                <p className="text-xs text-gray-500 mt-0.5">
+                <h3 className="text-sm font-semibold flex items-center gap-1.5">
+                  <span>🤖</span> Auto Scanner & Execução no Nascimento
+                </h3>
+                <p className="text-xs text-gray-400 mt-0.5">
                   {scanning
-                    ? `Monitorando ${selectedIds.length} ativos...`
-                    : "Scanner parado"}
+                    ? `Analisando aos 58s · Disparando no 00s (${selectedIds.length} ativos)`
+                    : "Scanner parado · Clique abaixo para iniciar"}
                 </p>
               </div>
               {scanning && (
-                <div className="flex items-center gap-1.5 text-xs text-emerald-400">
-                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  ATIVO
+                <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-bold bg-emerald-950/60 border border-emerald-500/40 px-2 py-1 rounded-full">
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                  ROBÔ ATIVO
                 </div>
               )}
             </div>
+
+            <div className="text-[11px] text-gray-400 bg-gray-950/80 border border-gray-800 rounded-lg p-2.5 mb-3 space-y-1">
+              <div className="flex items-center justify-between">
+                <span>⏱ Pré-Análise:</span>
+                <span className="text-sky-400 font-medium">aos 58s da vela 1M</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>⚡ Execução da Ordem:</span>
+                <span className="text-emerald-400 font-medium">ao nascer a nova vela (00s)</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>🎯 Trava de atraso:</span>
+                <span className="text-amber-400 font-medium">Desativada (Execução sem bloqueio)</span>
+              </div>
+            </div>
+
             {stopped ? (
               <button
                 onClick={startScan}
-                className="w-full py-3 rounded-xl font-bold bg-red-600 hover:bg-red-500 text-white transition-colors"
+                className="w-full py-3 rounded-xl font-bold bg-red-600 hover:bg-red-500 text-white transition-colors shadow-lg shadow-red-600/30"
               >
                 🔄 Reiniciar (Stop Loss resetado)
               </button>
@@ -717,15 +872,15 @@ function ScannerPage() {
                 onClick={stopScan}
                 className="w-full py-3 rounded-xl font-bold bg-gray-700 hover:bg-gray-600 text-white transition-colors"
               >
-                ⏹ Parar Scanner
+                ⏹ Parar Auto Scanner
               </button>
             ) : (
               <button
                 onClick={startScan}
                 disabled={!selectedIds.length}
-                className="w-full py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="w-full py-3 rounded-xl font-bold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors shadow-lg shadow-emerald-600/30 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                ▶ Iniciar Scanner
+                ▶ Iniciar Auto Scanner (Execução Automática)
               </button>
             )}
           </div>

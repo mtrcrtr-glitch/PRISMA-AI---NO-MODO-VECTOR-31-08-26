@@ -419,15 +419,35 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(0);
+  const [currentSec, setCurrentSec] = useState(0);
   const [entryAmount, setEntryAmount] = useState("1");
   const [isDemo, setIsDemo] = useState(true);
+  const [autoTrade, setAutoTrade] = useState(false);
   const [executing, setExecuting] = useState(false);
   const [lastExec, setLastExec] = useState<ExecRecord | null>(null);
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [nextTime, setNextTime] = useState("--:--:--");
+  const [brasiliaTime, setBrasiliaTime] = useState("--:--:--");
   const [force, setForce] = useState<Force>({ bullPct: 50, bearPct: 50, winner: "bull", leader: 0 });
   const tickSeriesRef = useRef<CandleData[]>([]);
   const countRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const analysisRef = useRef<AnalysisData | null>(null);
+  const assetRef = useRef<OtcAsset & { payout: number } | undefined>(asset);
+  const entryAmountRef = useRef<string>(entryAmount);
+  const isDemoRef = useRef<boolean>(isDemo);
+  const autoTradeRef = useRef<boolean>(autoTrade);
+  const executingRef = useRef<boolean>(executing);
+  const lastExecutedMinuteRef = useRef<number>(0);
+  const lastPreAnalysisMinuteRef = useRef<number>(0);
+  const brokerOffsetRef = useRef<number>(0);
+
+  analysisRef.current = analysis;
+  assetRef.current = asset;
+  entryAmountRef.current = entryAmount;
+  isDemoRef.current = isDemo;
+  autoTradeRef.current = autoTrade;
+  executingRef.current = executing;
 
   interface CandleData {
     time: number;
@@ -443,8 +463,13 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
     confidence: string;
     reasons: string[];
     blocks: string[];
+    emaMacro?: number;
+    emaInter?: number;
     ema9: number;
     ema21: number;
+    buffer1?: number;
+    buffer2?: number;
+    gatilhoTaxa50?: number | null;
     rsi: number;
     bbUpper: number;
     bbLower: number;
@@ -458,11 +483,17 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
     analysts: {
       name: string;
       icon: string;
-      direction: "call" | "put";
+      direction: "call" | "put" | "hold";
       confidence: number;
       opinion: string;
     }[];
     signalReady: boolean;
+    statusText?: string;
+    buyOK?: boolean;
+    sellOK?: boolean;
+    armedBuy?: boolean;
+    armedSell?: boolean;
+    markers?: TaxaDivididaMarker[];
   }
 
   interface ExecRecord {
@@ -472,23 +503,26 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
     reason: string;
     time: string;
     success: boolean;
+    auto?: boolean;
   }
 
   async function loadData() {
-    if (!asset) return;
+    if (!assetRef.current) return;
     setLoading(true);
     setError(null);
     try {
       const { fetchAnalysis } = await import("#/lib/otc.functions.ts");
-      const result = await fetchAnalysis({ data: { activeId: asset.id } });
+      const result = await fetchAnalysis({ data: { activeId: assetRef.current.id } });
       if ("error" in result) {
         setError(result.error ?? "Erro desconhecido");
         setAnalysis(null);
         setCandles([]);
       } else {
-        setAnalysis(result.analysis as AnalysisData);
+        const ana = result.analysis as AnalysisData;
+        setAnalysis(ana);
+        analysisRef.current = ana;
         setCandles(result.candles as CandleData[]);
-        setLivePrice((result.analysis as AnalysisData).lastPrice ?? null);
+        setLivePrice(ana.lastPrice ?? null);
         setError(null);
       }
     } catch {
@@ -499,51 +533,117 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
     }
   }
 
-  // Analysis is generated exactly at the birth of each 1M candle (:00, on the
-  // broker's minute boundary — displayed in Brasília time, UTC-3). Between
-  // candles the chart stays live through the 2s tick feed, without re-analyzing.
+  async function triggerExecution(dir: "call" | "put", isAuto = false) {
+    const curAsset = assetRef.current;
+    if (!curAsset || executingRef.current) return;
+    setExecuting(true);
+    executingRef.current = true;
+    try {
+      const { executeOrder } = await import("#/lib/otc.functions.ts");
+      const result = await executeOrder({
+        data: {
+          activeId: curAsset.id,
+          direction: dir,
+          amount: parseFloat(entryAmountRef.current) || 1,
+          duration: 60,
+          isDemo: isDemoRef.current,
+          skipVerify: true, // Instant birth entry with 0ms delay
+        },
+      });
+      setLastExec({
+        direction: dir,
+        amount: parseFloat(entryAmountRef.current) || 1,
+        verified: result.verified ?? true,
+        reason: result.success
+          ? isAuto
+            ? "🤖 [ROBÔ 00s] Entrada automática no nascimento da vela executada!"
+            : "✅ Ordem executada com sucesso no nascimento da vela!"
+          : result.reason ?? "Falha ao abrir ordem",
+        time: new Intl.DateTimeFormat("pt-BR", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          timeZone: "America/Sao_Paulo",
+        }).format(new Date()),
+        success: result.success ?? false,
+        auto: isAuto,
+      });
+    } catch {
+      setLastExec({
+        direction: dir,
+        amount: parseFloat(entryAmountRef.current) || 1,
+        verified: false,
+        reason: "Erro de comunicação ao executar ordem",
+        time: new Intl.DateTimeFormat("pt-BR", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          timeZone: "America/Sao_Paulo",
+        }).format(new Date()),
+        success: false,
+        auto: isAuto,
+      });
+    } finally {
+      setExecuting(false);
+      executingRef.current = false;
+    }
+  }
+
+  // Initial load when asset changes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const schedule = () => {
-      const now = Math.floor(Date.now() / 1000);
-      const msToBirth = (60 - (now % 60)) * 1000 + 200;
-      timer = setTimeout(() => void run(), msToBirth);
-    };
-
-    const run = async () => {
-      if (disposed) return;
-      await loadData();
-      if (!disposed) schedule();
-    };
-
-    void loadData(); // first view immediately
-    schedule();
-
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-    };
+    void loadData();
   }, [assetId]);
 
-  // Countdown to next candle (Brasília time, UTC-3 synchronized with broker clock)
-  const brokerOffsetRef = useRef<number>(0);
-
+  // Brasília Clock (UTC-3) + 58s Pre-Analysis + 00s Auto Birth Execution Engine
   useEffect(() => {
-    const fmt = new Intl.DateTimeFormat("pt-BR", {
+    const fmtTime = new Intl.DateTimeFormat("pt-BR", {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
       timeZone: "America/Sao_Paulo",
     });
-    countRef.current = setInterval(() => {
-      const now = Math.floor((Date.now() + brokerOffsetRef.current) / 1000);
-      setCountdown(60 - (now % 60));
-      const next = now + (60 - (now % 60));
-      setNextTime(fmt.format(new Date(next * 1000)));
-    }, 1000);
+
+    const tickClock = () => {
+      const nowMs = Date.now() + brokerOffsetRef.current;
+      const nowDate = new Date(nowMs);
+
+      // Current Brasília formatted time
+      const bTime = fmtTime.format(nowDate);
+      setBrasiliaTime(bTime);
+
+      const sec = nowDate.getSeconds();
+      setCurrentSec(sec);
+      const remaining = 60 - sec === 0 ? 60 : 60 - sec;
+      setCountdown(remaining);
+
+      const nextBirthDate = new Date(nowMs + remaining * 1000);
+      setNextTime(fmtTime.format(nextBirthDate));
+
+      const minuteKey = Math.floor(nowMs / 60000);
+
+      // 1. PRE-ANALYSIS at second 57s-58s (antecipated so signal is ready before 00s)
+      if (sec >= 57 && sec <= 58 && lastPreAnalysisMinuteRef.current !== minuteKey) {
+        lastPreAnalysisMinuteRef.current = minuteKey;
+        void loadData();
+      }
+
+      // 2. AUTOMATIC EXECUTION at exact candle birth (:59.8s / :00s)
+      if (
+        autoTradeRef.current &&
+        (sec === 0 || sec === 59) &&
+        lastExecutedMinuteRef.current !== minuteKey
+      ) {
+        const curAna = analysisRef.current;
+        if (curAna && (curAna.signalReady === true || curAna.buyOK || curAna.sellOK)) {
+          lastExecutedMinuteRef.current = minuteKey;
+          void triggerExecution(curAna.direction, true);
+        }
+      }
+    };
+
+    tickClock();
+    countRef.current = setInterval(tickClock, 1000);
     return () => {
       if (countRef.current) clearInterval(countRef.current);
     };
@@ -616,10 +716,6 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
           // ignore parse error
         }
       });
-
-      eventSource.onerror = () => {
-        // SSE error handled automatically by browser reconnect
-      };
     } catch {
       // Fallback handled by intervals
     }
@@ -655,41 +751,9 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
     };
   }, [asset?.id]);
 
-  async function handleExecute() {
+  async function handleManualExecute() {
     if (!analysis || !asset) return;
-    setExecuting(true);
-    try {
-      const { executeOrder } = await import("#/lib/otc.functions.ts");
-      const result = await executeOrder({
-        data: {
-          activeId: asset.id,
-          direction: analysis.direction,
-          amount: parseFloat(entryAmount) || 1,
-          duration: 60,
-          isDemo,
-          skipVerify: false,
-        },
-      });
-      setLastExec({
-        direction: analysis.direction,
-        amount: parseFloat(entryAmount) || 1,
-        verified: result.verified ?? false,
-        reason: result.reason ?? "",
-        time: new Date().toLocaleTimeString("pt-BR"),
-        success: result.success ?? false,
-      });
-    } catch {
-      setLastExec({
-        direction: analysis?.direction ?? "call",
-        amount: parseFloat(entryAmount) || 1,
-        verified: false,
-        reason: "Erro de comunicação",
-        time: new Date().toLocaleTimeString("pt-BR"),
-        success: false,
-      });
-    } finally {
-      setExecuting(false);
-    }
+    await triggerExecution(analysis.direction, false);
   }
 
   if (!asset) {
@@ -749,12 +813,25 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
           )}
         </div>
         <div className="flex items-center gap-2">
-          <div className="text-center bg-gray-800 px-3 py-1.5 rounded-lg">
-            <div className="text-xs text-gray-500">Próxima vela · Brasília</div>
-            <div className="text-lg font-bold tabular-nums text-orange-400">
-              {nextTime}
-              <span className="ml-1 text-xs font-medium text-gray-500">
-                em {String(countdown).padStart(2, "0")}s
+          {/* Brasília Clock Indicator */}
+          <div className="text-center bg-gray-800/90 border border-gray-700/60 px-3 py-1.5 rounded-lg">
+            <div className="text-[10px] uppercase font-bold text-gray-400 flex items-center justify-center gap-1">
+              <span>🇧🇷</span> Brasília (UTC-3)
+            </div>
+            <div className="text-base font-bold tabular-nums text-emerald-400">
+              {brasiliaTime}
+            </div>
+          </div>
+
+          {/* Candle countdown */}
+          <div className="text-center bg-gray-800/90 border border-gray-700/60 px-3 py-1.5 rounded-lg">
+            <div className="text-[10px] uppercase font-bold text-gray-400">
+              {currentSec >= 57 ? "⚡ Análise 58s Pronta" : "Fechamento Vela 1M"}
+            </div>
+            <div className="text-base font-bold tabular-nums text-orange-400">
+              {String(countdown).padStart(2, "0")}s
+              <span className="ml-1 text-[10px] font-medium text-gray-400">
+                (Abertura: {nextTime})
               </span>
             </div>
           </div>
@@ -878,13 +955,17 @@ function OtcPanel({ assets }: { assets: (OtcAsset & { payout: number })[]; live?
             ) : analysis ? (
               <SignalBox
                 analysis={analysis}
-                onExecute={() => void handleExecute()}
+                onExecute={() => void handleManualExecute()}
                 executing={executing}
                 entryAmount={entryAmount}
                 setEntryAmount={setEntryAmount}
                 isDemo={isDemo}
                 setIsDemo={setIsDemo}
                 assetPayout={asset.payout}
+                autoTrade={autoTrade}
+                setAutoTrade={setAutoTrade}
+                countdown={countdown}
+                currentSec={currentSec}
               />
             ) : null}
 
@@ -999,6 +1080,10 @@ function SignalBox({
   isDemo,
   setIsDemo,
   assetPayout,
+  autoTrade,
+  setAutoTrade,
+  countdown,
+  currentSec,
 }: {
   analysis: {
     direction: "call" | "put";
@@ -1028,6 +1113,10 @@ function SignalBox({
   isDemo: boolean;
   setIsDemo: (v: boolean) => void;
   assetPayout: number;
+  autoTrade: boolean;
+  setAutoTrade: (v: boolean) => void;
+  countdown: number;
+  currentSec: number;
 }) {
   const isCall = analysis.direction === "call";
   const ready = analysis.signalReady === true;
@@ -1051,9 +1140,50 @@ function SignalBox({
         <span className="text-xs font-bold text-gray-300 flex items-center gap-1.5">
           <span>🎯</span> JOSE TRADER · TAXA DIVIDIDA v3
         </span>
-        <span className="text-[10px] bg-emerald-500/20 text-emerald-400 font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 font-bold">
-          {ready ? "ENTRADA CONFIRMADA" : armed ? "SETUP ARMADO" : "MONITORANDO"}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-gray-400 font-mono">
+            Vela 1M: <strong className="text-orange-400">{countdown}s</strong>
+          </span>
+          {currentSec >= 57 && (
+            <span className="text-[10px] bg-sky-500/20 text-sky-400 font-mono px-2 py-0.5 rounded-full border border-sky-500/30 font-bold animate-pulse">
+              58s PRÉ-ANÁLISE OK
+            </span>
+          )}
+          <span className="text-[10px] bg-emerald-500/20 text-emerald-400 font-mono px-2 py-0.5 rounded-full border border-emerald-500/30 font-bold">
+            {ready ? "ENTRADA CONFIRMADA" : armed ? "SETUP ARMADO" : "MONITORANDO"}
+          </span>
+        </div>
+      </div>
+
+      {/* Auto-Execution Robot Banner */}
+      <div className={`px-4 py-2.5 border-b flex items-center justify-between ${
+        autoTrade 
+          ? "bg-emerald-950/60 border-emerald-500/40 text-emerald-300"
+          : "bg-gray-900/80 border-gray-800 text-gray-400"
+      }`}>
+        <div className="flex items-center gap-2">
+          <span className={`w-2.5 h-2.5 rounded-full ${autoTrade ? "bg-emerald-400 animate-ping" : "bg-gray-600"}`} />
+          <div>
+            <div className="text-xs font-bold flex items-center gap-1">
+              🤖 Execução Automática (Nascimento da Vela 00s)
+            </div>
+            <div className="text-[10px] text-gray-400">
+              {autoTrade
+                ? "Ativo: Analisa aos 58s e dispara sozinho no nascimento sem clicar"
+                : "Desativado: Ative para o robô entrar automaticamente no 00s"}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={() => setAutoTrade(!autoTrade)}
+          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all shadow-sm ${
+            autoTrade
+              ? "bg-emerald-500 hover:bg-emerald-400 text-black shadow-emerald-500/20"
+              : "bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700"
+          }`}
+        >
+          {autoTrade ? "LIGADO" : "DESLIGADO"}
+        </button>
       </div>
 
       {/* Direction & Main Trigger */}
@@ -1240,34 +1370,32 @@ function SignalBox({
         </div>
 
         {/* Execute button */}
-        {ready ? (
-          <button
-            onClick={onExecute}
-            disabled={executing}
-            className={`w-full py-3 rounded-xl font-bold text-base transition-all ${
-              executing
-                ? "bg-gray-700 text-gray-400 cursor-not-allowed"
-                : isCall
+        <button
+          onClick={onExecute}
+          disabled={executing}
+          className={`w-full py-3 rounded-xl font-bold text-base transition-all ${
+            executing
+              ? "bg-gray-700 text-gray-400 cursor-not-allowed"
+              : ready
+                ? isCall
                   ? "bg-emerald-500 hover:bg-emerald-400 text-black shadow-lg shadow-emerald-500/30 active:scale-95"
                   : "bg-red-500 hover:bg-red-400 text-white shadow-lg shadow-red-500/30 active:scale-95"
-            }`}
-          >
-            {executing ? (
-              <span className="flex items-center justify-center gap-2">
-                <div className="w-4 h-4 border-2 border-gray-500 border-t-white rounded-full animate-spin" />
-                Executando na Broker...
-              </span>
-            ) : (
-              `${isCall ? "▲ ENTRAR COMPRA" : "▼ ENTRAR VENDA"} (${isDemo ? "DEMO" : "REAL"})`
-            )}
-          </button>
-        ) : (
-          <div className="w-full py-3 rounded-xl text-center text-sm text-gray-500 bg-gray-800/50 border border-gray-800">
-            {armed
-              ? "⚡ Setup armado! Aguardando gatilho no nascimento da vela"
-              : "⏳ Aguardando confirmação do setup Taxa Dividida..."}
-          </div>
-        )}
+                : "bg-gray-700 hover:bg-gray-600 text-gray-200"
+          }`}
+        >
+          {executing ? (
+            <span className="flex items-center justify-center gap-2">
+              <div className="w-4 h-4 border-2 border-gray-500 border-t-white rounded-full animate-spin" />
+              Executando no Nascimento...
+            </span>
+          ) : ready ? (
+            `${isCall ? "▲ ENTRAR COMPRA AGORA" : "▼ ENTRAR VENDA AGORA"} (${isDemo ? "DEMO" : "REAL"})`
+          ) : autoTrade ? (
+            `🤖 ROBÔ ARMADO · Dispara no 00s (${isDemo ? "DEMO" : "REAL"})`
+          ) : (
+            `EXECUTAR ORDEM MANUAL (${isDemo ? "DEMO" : "REAL"})`
+          )}
+        </button>
       </div>
     </div>
   );
