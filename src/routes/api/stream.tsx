@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router"
 import "@tanstack/react-start"
 import { getSsid } from "#/lib/broker.server.ts"
+import { fetchGambolCandles } from "#/lib/gambol.server.ts"
 
 export const Route = createFileRoute("/api/stream")({
   server: {
@@ -10,11 +11,11 @@ export const Route = createFileRoute("/api/stream")({
         const activeIdParam = url.searchParams.get("activeId");
         const activeId = activeIdParam ? parseInt(activeIdParam, 10) : 76;
 
-        let ssid: string;
+        let ssid: string | null = null;
         try {
           ssid = await getSsid();
         } catch {
-          return new Response("Unauthorized", { status: 401 });
+          ssid = null;
         }
 
         const stream = new ReadableStream({
@@ -24,6 +25,7 @@ export const Route = createFileRoute("/api/stream")({
             let ws: WebSocket | null = null;
             let pollInterval: ReturnType<typeof setInterval> | null = null;
             let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+            let fallbackInterval: ReturnType<typeof setInterval> | null = null;
 
             const sendEvent = (event: string, data: unknown) => {
               if (isClosed) return;
@@ -41,6 +43,7 @@ export const Route = createFileRoute("/api/stream")({
               isClosed = true;
               if (pollInterval) clearInterval(pollInterval);
               if (keepAliveInterval) clearInterval(keepAliveInterval);
+              if (fallbackInterval) clearInterval(fallbackInterval);
               if (ws) {
                 try {
                   ws.close();
@@ -55,103 +58,137 @@ export const Route = createFileRoute("/api/stream")({
               }
             };
 
-            try {
-              ws = new WebSocket("wss://ws.trade.optgobroker.com/echo/websocket");
+            // Immediate initial timeSync
+            sendEvent("timeSync", { serverTime: Date.now(), clientTimestamp: Date.now() });
 
-              ws.addEventListener("open", () => {
-                if (isClosed || !ws) return;
-                ws.send(JSON.stringify({ name: "ssid", msg: ssid }));
-              });
-
-              ws.addEventListener("message", (ev) => {
+            const startFallbackStream = () => {
+              if (isClosed || fallbackInterval) return;
+              const pollTick = async () => {
                 if (isClosed) return;
-                let msg: { name?: string; msg?: unknown; request_id?: string };
                 try {
-                  msg = JSON.parse(ev.data as string);
-                } catch {
-                  return;
-                }
-
-                if (msg.name === "timeSync" && typeof msg.msg === "number") {
-                  sendEvent("timeSync", { serverTime: msg.msg, clientTimestamp: Date.now() });
-                }
-
-                if (msg.name === "profile") {
-                  if (msg.msg === false) {
-                    sendEvent("error", { message: "Sessão inválida" });
-                    cleanup();
-                    return;
-                  }
-                  // Start high frequency broker 1M candles feed (every 500ms)
-                  let reqCounter = 0;
-                  const requestCandles = () => {
-                    if (isClosed || !ws || ws.readyState !== WebSocket.OPEN) return;
-                    reqCounter++;
-                    ws.send(
-                      JSON.stringify({
-                        name: "sendMessage",
-                        request_id: `stream_${reqCounter}`,
-                        msg: {
-                          name: "get-candles",
-                          version: "2.0",
-                          body: { active_id: activeId, size: 60, duration: 60 },
-                        },
-                      })
-                    );
-                  };
-
-                  requestCandles();
-                  pollInterval = setInterval(requestCandles, 500);
-                }
-
-                if (msg.request_id && msg.request_id.startsWith("stream_")) {
-                  const data = msg.msg as { candles?: unknown[] } | unknown[] | undefined;
-                  const rawCandles = Array.isArray(data) ? data : data?.candles;
-                  if (Array.isArray(rawCandles) && rawCandles.length > 0) {
-                    const last = rawCandles[rawCandles.length - 1] as {
-                      from: number;
-                      open: number;
-                      max: number;
-                      min: number;
-                      close: number;
-                    };
+                  const candles = await fetchGambolCandles(activeId, 5);
+                  if (candles.length > 0) {
+                    const last = candles[candles.length - 1];
                     sendEvent("candle", {
-                      time: last.from,
-                      open: Number(last.open ?? 0),
-                      high: Number(last.max ?? last.open ?? 0),
-                      low: Number(last.min ?? last.open ?? 0),
-                      close: Number(last.close ?? 0),
+                      time: last.time,
+                      open: last.open,
+                      high: last.high,
+                      low: last.low,
+                      close: last.close,
                       activeId,
-                      allCount: rawCandles.length,
+                      allCount: candles.length,
                     });
                   }
-                }
-              });
-
-              ws.addEventListener("error", () => {
-                cleanup();
-              });
-
-              ws.addEventListener("close", () => {
-                cleanup();
-              });
-
-              // Heartbeat comment every 15s to keep SSE connection alive
-              keepAliveInterval = setInterval(() => {
-                if (isClosed) return;
-                try {
-                  controller.enqueue(encoder.encode(": keep-alive\n\n"));
+                  sendEvent("timeSync", { serverTime: Date.now(), clientTimestamp: Date.now() });
                 } catch {
-                  cleanup();
+                  // ignore transient poll error
                 }
-              }, 15000);
+              };
 
-              request.signal.addEventListener("abort", () => {
-                cleanup();
-              });
-            } catch {
-              cleanup();
+              void pollTick();
+              fallbackInterval = setInterval(pollTick, 1000);
+            };
+
+            if (ssid) {
+              try {
+                ws = new WebSocket("wss://ws.trade.optgobroker.com/echo/websocket");
+
+                ws.addEventListener("open", () => {
+                  if (isClosed || !ws) return;
+                  ws.send(JSON.stringify({ name: "ssid", msg: ssid }));
+                });
+
+                ws.addEventListener("message", (ev) => {
+                  if (isClosed) return;
+                  let msg: { name?: string; msg?: unknown; request_id?: string };
+                  try {
+                    msg = JSON.parse(ev.data as string);
+                  } catch {
+                    return;
+                  }
+
+                  if (msg.name === "timeSync" && typeof msg.msg === "number") {
+                    sendEvent("timeSync", { serverTime: msg.msg, clientTimestamp: Date.now() });
+                  }
+
+                  if (msg.name === "profile") {
+                    if (msg.msg === false) {
+                      startFallbackStream();
+                      return;
+                    }
+                    // Start high frequency broker 1M candles feed (every 500ms)
+                    let reqCounter = 0;
+                    const requestCandles = () => {
+                      if (isClosed || !ws || ws.readyState !== WebSocket.OPEN) return;
+                      reqCounter++;
+                      ws.send(
+                        JSON.stringify({
+                          name: "sendMessage",
+                          request_id: `stream_${reqCounter}`,
+                          msg: {
+                            name: "get-candles",
+                            version: "2.0",
+                            body: { active_id: activeId, size: 60, duration: 60 },
+                          },
+                        })
+                      );
+                    };
+
+                    requestCandles();
+                    pollInterval = setInterval(requestCandles, 500);
+                  }
+
+                  if (msg.request_id && msg.request_id.startsWith("stream_")) {
+                    const data = msg.msg as { candles?: unknown[] } | unknown[] | undefined;
+                    const rawCandles = Array.isArray(data) ? data : data?.candles;
+                    if (Array.isArray(rawCandles) && rawCandles.length > 0) {
+                      const last = rawCandles[rawCandles.length - 1] as {
+                        from: number;
+                        open: number;
+                        max: number;
+                        min: number;
+                        close: number;
+                      };
+                      sendEvent("candle", {
+                        time: last.from,
+                        open: Number(last.open ?? 0),
+                        high: Number(last.max ?? last.open ?? 0),
+                        low: Number(last.min ?? last.open ?? 0),
+                        close: Number(last.close ?? 0),
+                        activeId,
+                        allCount: rawCandles.length,
+                      });
+                    }
+                  }
+                });
+
+                ws.addEventListener("error", () => {
+                  startFallbackStream();
+                });
+
+                ws.addEventListener("close", () => {
+                  startFallbackStream();
+                });
+              } catch {
+                startFallbackStream();
+              }
+            } else {
+              startFallbackStream();
             }
+
+            // Heartbeat comment every 15s to keep SSE connection alive
+            keepAliveInterval = setInterval(() => {
+              if (isClosed) return;
+              try {
+                controller.enqueue(encoder.encode(": keep-alive\n\n"));
+              } catch {
+                cleanup();
+              }
+            }, 15000);
+
+            request.signal.addEventListener("abort", () => {
+              cleanup();
+            });
           },
         });
 

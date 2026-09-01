@@ -4,7 +4,11 @@
  */
 
 import type { Candle } from "#/lib/broker.server.ts";
-import { evaluateTaxaDividida, type TaxaDivididaMarker } from "#/lib/taxa-dividida.ts";
+import {
+  evaluateTaxaDividida,
+  type ConfluenceCheck,
+  type TaxaDivididaMarker,
+} from "#/lib/taxa-dividida.ts";
 
 export interface Analysis {
   direction: "call" | "put";
@@ -37,6 +41,14 @@ export interface Analysis {
   armedBuy: boolean;
   armedSell: boolean;
   markers: TaxaDivididaMarker[];
+  winRateDirect: number;
+  winRateGale1: number;
+  totalSignals: number;
+  winsDirect: number;
+  winsGale1: number;
+  losses: number;
+  aiConfluenceScore: number;
+  confluenceChecks: ConfluenceCheck[];
 }
 
 export interface AnalystVerdict {
@@ -205,6 +217,14 @@ export function analyze(candles: Candle[]): Analysis | null {
     armedBuy: taxaResult.armedBuy,
     armedSell: taxaResult.armedSell,
     markers: taxaResult.markers,
+    winRateDirect: taxaResult.winRateDirect,
+    winRateGale1: taxaResult.winRateGale1,
+    totalSignals: taxaResult.totalSignals,
+    winsDirect: taxaResult.winsDirect,
+    winsGale1: taxaResult.winsGale1,
+    losses: taxaResult.losses,
+    aiConfluenceScore: taxaResult.aiConfluenceScore,
+    confluenceChecks: taxaResult.confluenceChecks,
   };
 }
 

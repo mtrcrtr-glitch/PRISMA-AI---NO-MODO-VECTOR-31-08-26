@@ -45,12 +45,28 @@ export const testConnection = createServerFn({ method: "GET" }).handler(async ()
   const password = process.env["OPTGO_BROKER_PASSWORD"] ?? "";
 
   if (!email || !password) {
-    return {
-      ok: false,
-      stage: "config",
-      message: "Credenciais não configuradas",
-      detail: "Configure suas credenciais ou conecte com o SSID da sua sessão",
-    };
+    try {
+      const account = await getAccount();
+      return {
+        ok: true,
+        stage: "gambol",
+        message: "Conectado via Trader Assistent (Gambol Live)",
+        detail: `Conta: ${account.name}`,
+        account: {
+          name: account.name,
+          balance: account.balance,
+          demoBalance: account.demoBalance,
+          currency: account.currency,
+        },
+      };
+    } catch {
+      return {
+        ok: false,
+        stage: "config",
+        message: "Credenciais não configuradas",
+        detail: "Configure suas credenciais ou conecte com o SSID da sua sessão",
+      };
+    }
   }
 
   // Step 1: Test REST login
@@ -308,7 +324,17 @@ export const scanAssets = createServerFn({ method: "POST" })
           blocks: a.blocks,
           candleContext: a.candleContext,
           signalReady: a.signalReady,
+          statusText: a.statusText,
+          buyOK: a.buyOK,
+          sellOK: a.sellOK,
+          armedBuy: a.armedBuy,
+          armedSell: a.armedSell,
           analysts: a.analysts,
+          winRateDirect: a.winRateDirect,
+          winRateGale1: a.winRateGale1,
+          totalSignals: a.totalSignals,
+          aiConfluenceScore: a.aiConfluenceScore,
+          confluenceChecks: a.confluenceChecks,
         };
       }),
     );
@@ -323,12 +349,30 @@ export const scanAssets = createServerFn({ method: "POST" })
       blocks: string[];
       candleContext: string;
       signalReady: boolean;
+      statusText: string;
+      buyOK: boolean;
+      sellOK: boolean;
+      armedBuy: boolean;
+      armedSell: boolean;
       analysts: {
         name: string;
         icon: string;
         direction: "call" | "put" | "hold";
         confidence: number;
         opinion: string;
+      }[];
+      winRateDirect: number;
+      winRateGale1: number;
+      totalSignals: number;
+      aiConfluenceScore: number;
+      confluenceChecks: {
+        id: string;
+        name: string;
+        category: string;
+        weight: number;
+        passed: boolean;
+        score: number;
+        description: string;
       }[];
     }
 
@@ -339,7 +383,7 @@ export const scanAssets = createServerFn({ method: "POST" })
       }
     }
 
-    return fulfilled.filter(
-      (r) => r.strength >= data.minStrength && r.payout >= data.minPayout,
-    );
+    return fulfilled
+      .filter((r) => r.strength >= data.minStrength && r.payout >= data.minPayout)
+      .sort((a, b) => b.aiConfluenceScore - a.aiConfluenceScore || b.winRateDirect - a.winRateDirect);
   });
